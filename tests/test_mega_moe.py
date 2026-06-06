@@ -53,7 +53,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     buffer = deep_gemm.get_symm_buffer_for_mega_moe(
         group, num_experts,
         num_max_tokens_per_rank, num_topk,
-        hidden, intermediate_hidden
+        hidden, intermediate_hidden,
+        activation_dtype=args.activation_dtype
     )
 
     # Cast weights into FP4
@@ -87,9 +88,12 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             topk_idx.masked_fill_(rand_mask < args.masked_ratio, -1)
             topk_weights.masked_fill_(topk_idx < 0, 0)
 
-        # Cast inputs to FP8/FP4 with per-32 UE8M0 SF
+        # Cast inputs/weights to per-32 UE8M0 microscaled formats
         assert hidden % 128 == 0 and intermediate_hidden % 128 == 0
-        x = per_token_cast_to_fp8(x, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
+        if args.activation_dtype == 'mxfp4':
+            x = per_token_cast_to_fp4(x, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
+        else:
+            x = per_token_cast_to_fp8(x, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
         l1_weights = _cast_weights_to_fp4(l1_weights)
         l2_weights = _cast_weights_to_fp4(l2_weights)
 
@@ -108,8 +112,10 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             y=y, l1_weights=transformed_l1_weights, l2_weights=transformed_l2_weights,
             sym_buffer=buffer,
             cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats_fused,
+            activation_dtype=args.activation_dtype,
             activation_clamp=args.activation_clamp,
-            fast_math=bool(args.fast_math))
+            fast_math=bool(args.fast_math),
+            use_mxf4_kind=bool(args.use_mxf4_kind))
         deep_gemm.fp8_fp4_mega_moe(**kernel_kwargs)
         return y, cumulative_local_expert_recv_stats_fused
 
@@ -118,6 +124,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     dist_print(f' > Hidden: {hidden}', once_in_node=True)
     dist_print(f' > Intermediate: {intermediate_hidden}', once_in_node=True)
     dist_print(f' > Experts: {num_topk}/{num_experts}', once_in_node=True)
+    dist_print(f' > Activation dtype: {args.activation_dtype}, MXF4 kind: {bool(args.use_mxf4_kind)}', once_in_node=True)
     dist_print(f' > Buffer: {buffer.buffer.nbytes / 2 ** 30:.3f} GiB', once_in_node=True)
     dist_print(once_in_node=True)
 
@@ -135,7 +142,10 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         return
 
     # Non-overlapped baseline: EP dispatch + GEMM + EP combine
-    deep_ep, tilelang_ops, tilelang_bench, is_legacy_loaded = import_baseline()
+    if args.activation_dtype == 'fp8':
+        deep_ep, tilelang_ops, tilelang_bench, is_legacy_loaded = import_baseline()
+    else:
+        deep_ep, tilelang_ops, tilelang_bench, is_legacy_loaded = None, None, None, False
     alignment = deep_gemm.get_theoretical_mk_alignment_for_contiguous_layout()
     deep_gemm.set_mk_alignment_for_contiguous_layout(alignment)
     ep_buffer = deep_ep.ElasticBuffer(
@@ -216,19 +226,20 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     tflops = safe_div(2 * num_recv_tokens * (hidden * intermediate_hidden * 3) / 1e12, t_fused)
 
     # HBM bytes: weights + activations + output
+    activation_bytes = 0.5 if args.activation_dtype == 'mxfp4' else 1
     num_touched_experts = torch.unique(gathered_topk_idx[gathered_topk_idx >= 0]).numel()
     num_hbm_bytes = (
         num_touched_experts * intermediate_hidden * 2 * hidden * 0.5                                 # L1 weights
         + num_touched_experts * hidden * intermediate_hidden * 0.5                                   # L2 weights
-        + num_recv_tokens * hidden                                                                   # L1 acts read
-        + num_recv_tokens * intermediate_hidden                                                      # L1 output write
-        + num_recv_tokens * intermediate_hidden                                                      # L2 acts read
+        + num_recv_tokens * hidden * activation_bytes                                                # L1 acts read
+        + num_recv_tokens * intermediate_hidden * activation_bytes                                   # L1 output write
+        + num_recv_tokens * intermediate_hidden * activation_bytes                                   # L2 acts read
         + num_recv_tokens * hidden * 2                                                               # L2 output write (always BF16)
     )
     hbm_gbs = safe_div(num_hbm_bytes / 1e9, t_fused)
 
     # NVLink bytes: dispatch pull + combine write-back
-    num_nvlink_bytes = num_recv_tokens * hidden * 3
+    num_nvlink_bytes = num_recv_tokens * (hidden * activation_bytes + hidden * 2)
     nvlink_gbs = safe_div(num_nvlink_bytes / 1e9, t_fused)
 
     # Combine reduction (serial) time approximation
@@ -268,6 +279,10 @@ if __name__ == '__main__':
     parser.add_argument('--hidden', type=int, default=7168, help='Hidden size')
     parser.add_argument('--intermediate-hidden', type=int, default=3072, help='Intermediate hidden size')
     parser.add_argument('--activation-clamp', type=float, default=10, help='Clamp value for activation')
+    parser.add_argument('--activation-dtype', type=str, default='fp8', choices=['fp8', 'mxfp4'],
+                        help='Activation storage for input and post-SwiGLU activations')
+    parser.add_argument('--use-mxf4-kind', type=int, default=0,
+                        help='Use native SM100 kind::mxf4 for MXFP4 activations (0 or 1, default: 0)')
     parser.add_argument('--num-experts', type=int, default=384, help='Number of experts')
     parser.add_argument('--num-topk', type=int, default=6, help='Number of expert selections')
     parser.add_argument('--masked-ratio', type=float, default=0.0, help='Mask some expert selections')

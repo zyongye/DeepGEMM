@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cuda/std/cstdint>
+#include <cutlass/float_subbyte.h>
 #include <deep_gemm/common/compile.cuh>
 #include <deep_gemm/common/exception.cuh>
 
@@ -41,6 +42,19 @@ CUTLASS_HOST_DEVICE constexpr T constexpr_gcd(T a, T b) {
 template <typename T>
 CUTLASS_HOST_DEVICE constexpr T constexpr_min(T a, T b) {
     return a < b ? a : b;
+}
+
+template <typename dtype_t>
+CUTLASS_HOST_DEVICE constexpr uint32_t get_smem_elem_bits() {
+    if constexpr (cute::is_same_v<dtype_t, cutlass::detail::float_e2m1_unpacksmem_t> or
+                  cute::is_same_v<dtype_t, cutlass::detail::float_e2m3_unpacksmem_t> or
+                  cute::is_same_v<dtype_t, cutlass::detail::float_e3m2_unpacksmem_t> or
+                  cute::is_same_v<dtype_t, cutlass::detail::type_erased_dynamic_float4_unpacksmem_t> or
+                  cute::is_same_v<dtype_t, cutlass::detail::type_erased_dynamic_float6_unpacksmem_t>) {
+        return 8;
+    } else {
+        return cute::sizeof_bits_v<dtype_t>;
+    }
 }
 
 template <typename T>
@@ -96,6 +110,36 @@ CUTLASS_DEVICE void get_e4m3_sf_and_sf_inv(const float2& amax, float2& sf, float
     const auto exp_y = fast_log2_ceil(scaled.y);
     sf.x = fast_pow2(exp_x), sf_inv.x = fast_pow2(-exp_x);
     sf.y = fast_pow2(exp_y), sf_inv.y = fast_pow2(-exp_y);
+}
+
+template <bool kUseUE8M0 = true>
+CUTLASS_DEVICE void get_e2m1_sf_and_sf_inv(const float2& amax, float2& sf, float2& sf_inv) {
+    DG_STATIC_ASSERT(kUseUE8M0, "Must use UE8M0");
+    const float2 finfo_factor = {1.0 / 6.0, 1.0 / 6.0};
+    const auto scaled = __fmul2_rn(amax, finfo_factor);
+    const auto exp_x = fast_log2_ceil(scaled.x);
+    const auto exp_y = fast_log2_ceil(scaled.y);
+    sf.x = fast_pow2(exp_x), sf_inv.x = fast_pow2(-exp_x);
+    sf.y = fast_pow2(exp_y), sf_inv.y = fast_pow2(-exp_y);
+}
+
+CUTLASS_DEVICE uint32_t cast_into_e2m1_code(const float& value) {
+    const bool is_negative = value < 0;
+    float abs_value = is_negative ? -value : value;
+    abs_value = abs_value > 6.0f ? 6.0f : abs_value;
+    uint32_t code = 0;
+    code = abs_value > 0.25f ? 1 : code;
+    code = abs_value > 0.75f ? 2 : code;
+    code = abs_value > 1.25f ? 3 : code;
+    code = abs_value > 1.75f ? 4 : code;
+    code = abs_value > 2.50f ? 5 : code;
+    code = abs_value > 3.50f ? 6 : code;
+    code = abs_value > 5.00f ? 7 : code;
+    return code | (is_negative and code != 0 ? 0x8u : 0u);
+}
+
+CUTLASS_DEVICE uint32_t cvt_pack_f32_to_e2m1x2(const float& a, const float& b) {
+    return cast_into_e2m1_code(a) | (cast_into_e2m1_code(b) << 4);
 }
 
 /// Reduction

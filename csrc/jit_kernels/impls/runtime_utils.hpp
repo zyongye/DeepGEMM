@@ -56,6 +56,7 @@ static std::string to_string(const at::ScalarType& dtype) {
         case torch::kFloat:         return "float";
         case torch::kBFloat16:      return "cutlass::bfloat16_t";
         case torch::kFloat8_e4m3fn: return "cutlass::float_e4m3_t";
+        case torch::kUInt8:         return "uint8_t";
         case kPackedFP4:            return "cutlass::detail::float_e2m1_unpacksmem_t";
         default: DG_HOST_UNREACHABLE("Unsupported dtype");
     }
@@ -82,6 +83,7 @@ static CUtensorMapDataType aten_dtype_to_tensor_map_dtype(const at::ScalarType& 
         case torch::kFloat:         return CU_TENSOR_MAP_DATA_TYPE_FLOAT32;
         case torch::kBFloat16:      return CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
         case torch::kFloat8_e4m3fn: return CU_TENSOR_MAP_DATA_TYPE_UINT8;
+        case torch::kUInt8:         return CU_TENSOR_MAP_DATA_TYPE_UINT8;
 #if CUDA_VERSION >= 12080
         case kPackedFP4:            return fp4_unpacked_smem ? CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B
                                                              : CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B;

@@ -88,7 +88,11 @@ constexpr uint32_t get_umma_desc_stride_k() {
 template <cute::UMMA::Major kMajorMode, uint32_t BLOCK_MN, uint32_t kSwizzleMode, typename dtype_t>
 CUTLASS_DEVICE
 uint32_t advance_umma_desc_lo(const uint32_t& base, const uint32_t& offset, const uint32_t& k_idx) {
-    return base + (((offset + k_idx * get_umma_desc_stride_k<kMajorMode, BLOCK_MN, kSwizzleMode, dtype_t>()) * static_cast<uint32_t>(sizeof(dtype_t))) >> 4u);
+    constexpr uint32_t kElemBits = math::get_smem_elem_bits<dtype_t>();
+    const uint64_t k_offset_bits =
+        static_cast<uint64_t>(k_idx) * get_umma_desc_stride_k<kMajorMode, BLOCK_MN, kSwizzleMode, dtype_t>() * kElemBits;
+    DG_DEVICE_ASSERT(k_offset_bits % 8 == 0);
+    return base + ((offset + static_cast<uint32_t>(k_offset_bits / 8)) >> 4u);
 }
 
 template <cute::UMMA::Major kMajorMode, uint32_t BLOCK_MN, uint32_t BLOCK_K, uint32_t kSwizzleMode, bool kUseBase32 = false, typename dtype_t>
@@ -97,18 +101,24 @@ cute::UMMA::SmemDescriptor make_umma_desc(dtype_t* base_smem_ptr, uint32_t mn_id
     const uint32_t stride_k = get_umma_desc_stride_k<kMajorMode, BLOCK_MN, kSwizzleMode, dtype_t>();
     const auto layout_type = to_umma_layout_type<kMajorMode, kSwizzleMode, kUseBase32, dtype_t>();
     const auto num_non_contiguous = 128 / get_atom_base(layout_type);
+    constexpr uint32_t kElemBits = math::get_smem_elem_bits<dtype_t>();
+    const auto advance_logical_elements = [](void* ptr, const uint64_t& num_elements) {
+        const uint64_t num_bits = num_elements * kElemBits;
+        DG_DEVICE_ASSERT(num_bits % 8 == 0);
+        return math::advance_ptr(ptr, num_bits / 8);
+    };
     if constexpr (kMajorMode == cute::UMMA::Major::K) {
         // NOTES: for K-major layout, the swizzle must be the same as `BLOCK_K * sizeof(dtype_t)`
         // also, atom index must be 0, so that each block has exactly one swizzle atom on the K axis
-        DG_STATIC_ASSERT(kSwizzleMode == BLOCK_K * sizeof(dtype_t), "Unexpected value");
+        DG_STATIC_ASSERT(kSwizzleMode * 8 == BLOCK_K * kElemBits, "Unexpected value");
 
         // Atom size: 8 x `kSwizzleMode` (in bytes, on K)
         // {SBO, LBO} means the byte stride between atoms on {MN, K}
         // NOTES: on K, there is only 1 atom as asserted previously, so LBO can be 0
-        const uint32_t stride_byte_offset = num_non_contiguous * BLOCK_K * sizeof(dtype_t);
+        const uint32_t stride_byte_offset = num_non_contiguous * BLOCK_K * kElemBits / 8;
         const uint32_t leading_byte_offset = 0;
         return make_smem_desc(layout_type,
-                              base_smem_ptr + mn_idx * BLOCK_K + k_idx * stride_k,
+                              advance_logical_elements(base_smem_ptr, mn_idx * BLOCK_K + k_idx * stride_k),
                               stride_byte_offset, leading_byte_offset);
     } else {
         constexpr uint32_t BLOCK_MN_ATOM = tma::get_inner_block_atom_size<BLOCK_MN, kSwizzleMode, dtype_t>();
@@ -122,12 +132,12 @@ cute::UMMA::SmemDescriptor make_umma_desc(dtype_t* base_smem_ptr, uint32_t mn_id
         // NOTES: `kSwizzleMode == 16` mean non-swizzling but interleaving
         // {SBO, LBO} means the byte stride between atoms on {K, MN} for swizzling
         // {SBO, LBO} means the byte stride between atoms on {MN, K} for non-swizzling
-        uint32_t stride_byte_offset = num_non_contiguous * BLOCK_MN_ATOM * sizeof(dtype_t);
-        uint32_t leading_byte_offset = BLOCK_K * BLOCK_MN_ATOM * sizeof(dtype_t);
+        uint32_t stride_byte_offset = num_non_contiguous * BLOCK_MN_ATOM * kElemBits / 8;
+        uint32_t leading_byte_offset = BLOCK_K * BLOCK_MN_ATOM * kElemBits / 8;
         if constexpr (kSwizzleMode == 16)
             math::swap(stride_byte_offset, leading_byte_offset);
         return make_smem_desc(layout_type,
-                              base_smem_ptr + mn_idx * BLOCK_K + k_idx * stride_k,
+                              advance_logical_elements(base_smem_ptr, mn_idx * BLOCK_K + k_idx * stride_k),
                               stride_byte_offset, leading_byte_offset);
     }
 }

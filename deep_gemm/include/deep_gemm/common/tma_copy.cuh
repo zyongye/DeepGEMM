@@ -5,12 +5,13 @@
 #include <cutlass/arch/barrier.h>
 
 #include <deep_gemm/common/exception.cuh>
+#include <deep_gemm/common/math.cuh>
 
 namespace deep_gemm::tma {
 
 template <uint32_t BLOCK_INNER, uint32_t kSwizzleMode, typename dtype_t>
 constexpr uint32_t get_inner_block_atom_size() {
-    return kSwizzleMode == 0 ? BLOCK_INNER : kSwizzleMode / sizeof(dtype_t);
+    return kSwizzleMode == 0 ? BLOCK_INNER : kSwizzleMode * 8 / math::get_smem_elem_bits<dtype_t>();
 }
 
 template <uint32_t BLOCK_INNER, uint32_t BLOCK_OUTER,

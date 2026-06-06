@@ -24,6 +24,8 @@ class Compiler {
 public:
     static std::filesystem::path library_root_path;
     static std::filesystem::path library_include_path;
+    static std::filesystem::path third_party_cutlass_include_path;
+    static std::filesystem::path third_party_fmt_include_path;
     static std::filesystem::path cuda_home;
     static std::filesystem::path cuobjdump_path;
 
@@ -31,6 +33,9 @@ public:
                              const std::string& cuda_home_path_by_python) {
         Compiler::library_root_path = library_root_path;
         Compiler::library_include_path = Compiler::library_root_path / "include";
+        const auto repository_root_path = Compiler::library_root_path.parent_path();
+        Compiler::third_party_cutlass_include_path = repository_root_path / "third-party" / "cutlass" / "include";
+        Compiler::third_party_fmt_include_path = repository_root_path / "third-party" / "fmt" / "include";
         Compiler::cuda_home = cuda_home_path_by_python;
         Compiler::cuobjdump_path = Compiler::cuda_home / "bin" / "cuobjdump";
     }
@@ -165,6 +170,8 @@ public:
 
 DG_DECLARE_STATIC_VAR_IN_CLASS(Compiler, library_root_path);
 DG_DECLARE_STATIC_VAR_IN_CLASS(Compiler, library_include_path);
+DG_DECLARE_STATIC_VAR_IN_CLASS(Compiler, third_party_cutlass_include_path);
+DG_DECLARE_STATIC_VAR_IN_CLASS(Compiler, third_party_fmt_include_path);
 DG_DECLARE_STATIC_VAR_IN_CLASS(Compiler, cuda_home);
 DG_DECLARE_STATIC_VAR_IN_CLASS(Compiler, cuobjdump_path);
 
@@ -202,10 +209,14 @@ public:
         // The override the compiler flags
         // Only NVCC >= 12.9 supports arch-specific family suffix
         const auto arch = device_runtime->get_arch(false, nvcc_major > 12 or nvcc_minor >= 9);
-        flags = fmt::format("{} -I{} --gpu-architecture=sm_{} "
+        flags = fmt::format("{} -I{} -I{} -I{} --gpu-architecture=sm_{} "
                             "--compiler-options=-fPIC,-O3,-fconcepts,-Wno-deprecated-declarations,-Wno-abi "
                             "-O3 --expt-relaxed-constexpr --expt-extended-lambda",
-                            flags, library_include_path.c_str(), arch);
+                            flags,
+                            library_include_path.c_str(),
+                            third_party_cutlass_include_path.c_str(),
+                            third_party_fmt_include_path.c_str(),
+                            arch);
     }
 
     void compile(const std::string &code, const std::filesystem::path& dir_path,
@@ -263,6 +274,8 @@ public:
         // Build include directories list
         std::string include_dirs;
         include_dirs += fmt::format("-I{} ", library_include_path.string());
+        include_dirs += fmt::format("-I{} ", third_party_cutlass_include_path.string());
+        include_dirs += fmt::format("-I{} ", third_party_fmt_include_path.string());
         include_dirs += fmt::format("-I{} ", (cuda_home / "include").string());
 
         // Add PCH support for version 12.8 and above
