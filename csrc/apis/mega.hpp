@@ -22,12 +22,15 @@ get_symm_buffer_size_for_mega_moe(
     const int& num_max_tokens_per_rank, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
     const bool& use_fp8_dispatch, const std::string& activation,
-    const std::string& activation_dtype) {
+    const std::string& activation_dtype,
+    const std::string& combine_dtype) {
     DG_HOST_ASSERT(num_experts % num_ranks == 0);
     DG_HOST_ASSERT(use_fp8_dispatch);
     DG_HOST_ASSERT(activation == "swiglu");
     DG_HOST_ASSERT(activation_dtype == "fp8" or activation_dtype == "mxfp4");
+    DG_HOST_ASSERT(combine_dtype == "bf16" or combine_dtype == "mxfp8");
     const bool use_fp4_activations = activation_dtype == "mxfp4";
+    const bool use_mxfp8_combine = combine_dtype == "mxfp8";
 
     // Workspace bytes
     const auto workspace = layout::Workspace(nullptr, num_ranks, num_experts, num_max_tokens_per_rank, num_topk);
@@ -35,6 +38,7 @@ get_symm_buffer_size_for_mega_moe(
     // Layouts
     const auto activation_token_layout = layout::Data(use_fp4_activations ? hidden / 2 : hidden);
     const auto bf16_token_layout = layout::Data(hidden * 2);
+    const auto mxfp8_token_layout = layout::Data(hidden + hidden / 32);
     const auto intermediate_activation_token_layout = layout::Data(
         use_fp4_activations ? intermediate_hidden / 2 : intermediate_hidden);
     const auto fp8_sf_layout = layout::Data(hidden / 32);
@@ -86,9 +90,9 @@ get_symm_buffer_size_for_mega_moe(
         fp8_intermediate_sf_layout, 1, num_max_padded_sf_pool_tokens,
         l2_token_buffer.get_end_ptr());
 
-    // Combine input buffer: BF16 tokens for cross-rank combine
+    // Combine input buffer: BF16 or MXFP8 tokens for cross-rank combine
     const auto combine_token_buffer = layout::Buffer(
-        bf16_token_layout, num_topk, num_max_tokens_per_rank,
+        use_mxfp8_combine ? mxfp8_token_layout : bf16_token_layout, num_topk, num_max_tokens_per_rank,
         l2_sf_buffer.get_end_ptr());
 
     // Check SF buffer requirements
@@ -150,6 +154,7 @@ static void fp8_fp4_mega_moe(
     const std::tuple<int, int, int>& recipe,
     const std::string& activation,
     const std::string& activation_dtype,
+    const std::string& combine_dtype,
     const std::optional<float>& activation_clamp_opt,
     const bool& fast_math,
     const bool& use_mxf4_kind
@@ -163,8 +168,11 @@ static void fp8_fp4_mega_moe(
     DG_HOST_ASSERT(rm == 1 and rn == 1 and rk == 32);
     DG_HOST_ASSERT(activation == "swiglu");
     DG_HOST_ASSERT(activation_dtype == "fp8" or activation_dtype == "mxfp4");
+    DG_HOST_ASSERT(combine_dtype == "bf16" or combine_dtype == "mxfp8");
     const bool use_fp4_activations = activation_dtype == "mxfp4";
+    const bool use_mxfp8_combine = combine_dtype == "mxfp8";
     DG_HOST_ASSERT(not use_mxf4_kind or use_fp4_activations);
+    DG_HOST_ASSERT(y.scalar_type() == torch::kBFloat16);
 
     // Activation checks
     const auto activation_clamp =
@@ -206,7 +214,7 @@ static void fp8_fp4_mega_moe(
         num_ranks, num_experts,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
-        true, activation, activation_dtype);
+        true, activation, activation_dtype, combine_dtype);
     DG_HOST_ASSERT(sym_buffer.nbytes() >= static_cast<size_t>(num_required_bytes));
     DG_HOST_ASSERT(num_experts == num_experts_);
 
@@ -228,6 +236,7 @@ static void fp8_fp4_mega_moe(
                                hidden, intermediate_hidden,
                                use_fp4_activations,
                                use_mxf4_kind,
+                               use_mxfp8_combine,
                                activation_clamp, fast_math);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");

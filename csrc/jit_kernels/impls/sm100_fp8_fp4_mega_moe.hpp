@@ -26,6 +26,7 @@ public:
         float activation_clamp;
         bool use_fp4_activations;
         bool use_mxf4_kind;
+        bool use_mxfp8_combine;
         bool fast_math;
         MegaMoEConfig config;
 
@@ -74,6 +75,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
         {}
     >);
 }};
@@ -92,6 +94,7 @@ static void __instantiate_kernel() {{
     args.launch_args.grid_dim.first, args.num_ranks,
     args.use_fp4_activations ? "true" : "false",
     args.use_mxf4_kind ? "true" : "false",
+    args.use_mxfp8_combine ? "true" : "false",
     to_string(args.activation_clamp),
     args.fast_math ? "true" : "false");
     }
@@ -130,6 +133,7 @@ static void sm100_fp8_fp4_mega_moe(
     const int& hidden, const int& intermediate_hidden,
     const bool& use_fp4_activations,
     const bool& use_mxf4_kind,
+    const bool& use_mxfp8_combine,
     const float& activation_clamp,
     const bool& fast_math
 ) {
@@ -227,6 +231,7 @@ static void sm100_fp8_fp4_mega_moe(
         .activation_clamp = activation_clamp,
         .use_fp4_activations = use_fp4_activations,
         .use_mxf4_kind = use_mxf4_kind,
+        .use_mxfp8_combine = use_mxfp8_combine,
         .fast_math = fast_math,
         .config = config,
         .y = y.data_ptr(),

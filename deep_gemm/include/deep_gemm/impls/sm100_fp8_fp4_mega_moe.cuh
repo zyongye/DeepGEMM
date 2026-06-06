@@ -35,6 +35,7 @@ template <
     uint32_t kNumSMs, uint32_t kNumRanks,
     bool kUseFP4Activations,
     bool kUseMxf4Kind,
+    bool kUseMXFP8Combine,
     float kActivationClamp,
     bool kFastMath,
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
@@ -75,6 +76,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     DG_STATIC_ASSERT((not kUseFP4Activations) or (kHidden % 2 == 0 and kIntermediateHidden % 2 == 0),
                      "Packed FP4 activations require even logical widths");
     DG_STATIC_ASSERT((not kUseMxf4Kind) or kUseFP4Activations, "Native MXF4 requires FP4 activations");
+    DG_STATIC_ASSERT((not kUseMXFP8Combine) or kHidden % 128 == 0, "MXFP8 combine requires hidden to be 128-aligned");
 
     // Thread indices
     const bool is_leader_cta = cute::block_rank_in_cluster() == 0;
@@ -101,10 +103,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         sym_buffer.get_base_ptr(), kNumRanks, kNumExperts, kNumMaxTokensPerRank, kNumTopk);
 
     // Token and buffer layouts
+    constexpr uint32_t kGranK = 32;
     constexpr uint32_t kInputTokenBytes = kUseFP4Activations ? kHidden / 2 : kHidden;
     constexpr uint32_t kIntermediateTokenBytes = kUseFP4Activations ? kIntermediateHidden / 2 : kIntermediateHidden;
+    constexpr uint32_t kCombineTokenDataBytes = kUseMXFP8Combine ? kHidden : kHidden * sizeof(nv_bfloat16);
+    constexpr uint32_t kCombineTokenSFBytes = kUseMXFP8Combine ? kHidden / kGranK : 0;
     constexpr auto activation_token_layout = layout::Data(kInputTokenBytes);
-    constexpr auto bf16_token_layout = layout::Data(kHidden * sizeof(nv_bfloat16));
+    constexpr auto combine_token_layout = layout::Data(kCombineTokenDataBytes + kCombineTokenSFBytes);
     constexpr auto intermediate_activation_token_layout = layout::Data(kIntermediateTokenBytes);
     constexpr auto fp8_sf_layout = layout::Data(kHidden / 32);
     constexpr auto fp8_intermediate_sf_layout = layout::Data(kIntermediateHidden / 32);
@@ -127,7 +132,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         input_topk_idx_buffer.get_end_ptr());
 
     // SF and its buffer configs
-    constexpr uint32_t kGranK = 32;
     constexpr uint32_t kNumUTCCPAlignedElems = 128;
     DG_STATIC_ASSERT(SF_BLOCK_M == math::constexpr_align(BLOCK_M, kNumUTCCPAlignedElems), "Invalid SF_BLOCK_M");
     DG_STATIC_ASSERT(SF_BLOCK_N == BLOCK_N, "No padding is needed for SFB");
@@ -162,7 +166,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
     // Combine inputs
     const auto combine_token_buffer = layout::Buffer(
-        bf16_token_layout, kNumTopk, kNumMaxTokensPerRank,
+        combine_token_layout, kNumTopk, kNumMaxTokensPerRank,
         l2_sf_buffer.get_end_ptr()
     );
 
@@ -1269,29 +1273,91 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             shared_storage.tmem_empty_barriers[accum_stage_idx].arrive(0u);
                         }
 
-                        // Store into shared memory
-                        // NOTES: each lane provides its own address for stmatrix; 2 warps share a BF16 swizzle atom
-                        uint32_t row = lane_idx % 8;
-                        uint32_t col = (epilogue_warp_idx % 2) * 4 + lane_idx / 8;
-                        const auto smem_ptr = reinterpret_cast<uint8_t*>(shared_storage.smem_d.l2[epilogue_wg_idx]) +
-                            (warp_idx_in_wg / 2) * STORE_BLOCK_M * kSwizzleCDMode +
-                            i * ATOM_M * kSwizzleCDMode +
-                            row * (kNumBankGroupBytes * 8) +
-                            (col ^ row) * kNumBankGroupBytes;
-                        ptx::SM90_U32x4_STSM_T<uint32_t>::copy(
-                            math::cast_into_bf16_and_pack(values[0], values[1]),
-                            math::cast_into_bf16_and_pack(values[2], values[3]),
-                            math::cast_into_bf16_and_pack(values[4], values[5]),
-                            math::cast_into_bf16_and_pack(values[6], values[7]),
-                            smem_ptr
-                        );
+                        // Store into shared memory.
+                        if constexpr (kUseMXFP8Combine) {
+                            // Each warp owns one 32-column MXFP8 scale group for all 8 rows in this atom.
+                            // The TMEM/STSM layout maps lanes with the same `lane_idx % 4` to the same row
+                            // pair, and even/odd accumulator registers to the even/odd row respectively.
+                            float fp32_values[ATOM_M];
+                            #pragma unroll
+                            for (uint32_t k = 0; k < ATOM_M; ++ k)
+                                fp32_values[k] = *reinterpret_cast<float*>(&values[k]);
+
+                            float local_amax_even = 0.0f, local_amax_odd = 0.0f;
+                            #pragma unroll
+                            for (uint32_t k = 0; k < ATOM_M / 2; ++ k) {
+                                local_amax_even = cute::max(local_amax_even, cute::abs(fp32_values[k * 2 + 0]));
+                                local_amax_odd  = cute::max(local_amax_odd,  cute::abs(fp32_values[k * 2 + 1]));
+                            }
+                            const float amax_even = math::warp_reduce<4, true>(
+                                local_amax_even, math::ReduceMax<float>());
+                            const float amax_odd = math::warp_reduce<4, true>(
+                                local_amax_odd, math::ReduceMax<float>());
+
+                            float sf_even, sf_inv_even, sf_odd, sf_inv_odd;
+                            math::get_e4m3_sf_and_sf_inv(amax_even, sf_even, sf_inv_even);
+                            math::get_e4m3_sf_and_sf_inv(amax_odd, sf_odd, sf_inv_odd);
+
+                            // Stage one scale byte per row for this warp's 32-column group.
+                            if (lane_idx < 4) {
+                                const auto sf_smem_base = reinterpret_cast<uint8_t*>(shared_storage.smem_d.l2[epilogue_wg_idx]) +
+                                    STORE_BLOCK_M * kSwizzleCDMode;
+                                #pragma unroll
+                                for (uint32_t parity = 0; parity < 2; ++ parity) {
+                                    const uint32_t row_in_store = i * ATOM_M + lane_idx * 2 + parity;
+                                    const float sf = parity == 0 ? sf_even : sf_odd;
+                                    const auto sf_byte = static_cast<uint8_t>(
+                                        *reinterpret_cast<const uint32_t*>(&sf) >> 23);
+                                    ptx::st_shared(sf_smem_base + row_in_store * (BLOCK_N / kGranK) + warp_idx_in_wg,
+                                                   sf_byte);
+                                }
+                            }
+
+                            const uint32_t fp8_low = math::cvt_pack_f32_to_e4m3x4(make_float4(
+                                fp32_values[0] * sf_inv_even, fp32_values[1] * sf_inv_odd,
+                                fp32_values[2] * sf_inv_even, fp32_values[3] * sf_inv_odd));
+                            const uint32_t fp8_high = math::cvt_pack_f32_to_e4m3x4(make_float4(
+                                fp32_values[4] * sf_inv_even, fp32_values[5] * sf_inv_odd,
+                                fp32_values[6] * sf_inv_even, fp32_values[7] * sf_inv_odd));
+
+                            // One U8x4 store writes two 8-byte logical chunks for the row pair. Two stores
+                            // cover the warp's full 32-column MXFP8 group.
+                            const uint32_t row = lane_idx;
+                            const uint32_t col = warp_idx_in_wg * 2;
+                            auto smem_ptr = reinterpret_cast<uint8_t*>(shared_storage.smem_d.l2[epilogue_wg_idx]) +
+                                i * ATOM_M * kSwizzleCDMode +
+                                row * kSwizzleCDMode +
+                                (col ^ (row / 2)) * kNumBankGroupBytes;
+                            ptx::SM100_U8x4_STSM_T<uint32_t>::copy(fp8_low, smem_ptr);
+                            smem_ptr = reinterpret_cast<uint8_t*>(shared_storage.smem_d.l2[epilogue_wg_idx]) +
+                                i * ATOM_M * kSwizzleCDMode +
+                                row * kSwizzleCDMode +
+                                ((col + 1) ^ (row / 2)) * kNumBankGroupBytes;
+                            ptx::SM100_U8x4_STSM_T<uint32_t>::copy(fp8_high, smem_ptr);
+                        } else {
+                            // NOTES: each lane provides its own address for stmatrix; 2 warps share a BF16 swizzle atom
+                            uint32_t row = lane_idx % 8;
+                            uint32_t col = (epilogue_warp_idx % 2) * 4 + lane_idx / 8;
+                            const auto smem_ptr = reinterpret_cast<uint8_t*>(shared_storage.smem_d.l2[epilogue_wg_idx]) +
+                                (warp_idx_in_wg / 2) * STORE_BLOCK_M * kSwizzleCDMode +
+                                i * ATOM_M * kSwizzleCDMode +
+                                row * (kNumBankGroupBytes * 8) +
+                                (col ^ row) * kNumBankGroupBytes;
+                            ptx::SM90_U32x4_STSM_T<uint32_t>::copy(
+                                math::cast_into_bf16_and_pack(values[0], values[1]),
+                                math::cast_into_bf16_and_pack(values[2], values[3]),
+                                math::cast_into_bf16_and_pack(values[4], values[5]),
+                                math::cast_into_bf16_and_pack(values[6], values[7]),
+                                smem_ptr
+                            );
+                        }
                     }
 
                     // Wait shared memory ready
                     ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
 
-                    // Write into remote buffers
-                    // Each warp writes 2 rows (lane_idx/16 splits the warp into two halves, one per row)
+                    // Write into remote buffers.
+                    // Each warp writes 2 rows (lane_idx/16 splits the warp into two halves, one per row).
                     const uint32_t row_in_atom = (warp_idx_in_wg * 2 + lane_idx / 16) % ATOM_M;
                     const uint32_t bank_group_idx = lane_idx % 8;
 
@@ -1310,19 +1376,44 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         const uint32_t dst_topk_idx = src_metadata.topk_idx;
 
                         // Read from shared memory
-                        const auto smem_ptr = reinterpret_cast<uint8_t*>(shared_storage.smem_d.l2[epilogue_wg_idx]) +
-                            (lane_idx % 16 / 8) * STORE_BLOCK_M * kSwizzleCDMode +
-                            row_in_store * kSwizzleCDMode +
-                            (bank_group_idx ^ row_in_atom) * kNumBankGroupBytes;
-                        const auto packed = ptx::ld_shared(reinterpret_cast<float4*>(smem_ptr));
-
-                        // Write into remote
+                        // Write into remote.
                         const auto dst_token = combine_token_buffer.get_rank_buffer(dst_topk_idx)
                                                .get_data_buffer(dst_token_idx);
-                        const auto dst_ptr = math::advance_ptr<float4>(
-                            dst_token.get_base_ptr(),
-                            n_idx * static_cast<uint32_t>(sizeof(nv_bfloat16)) + (lane_idx % 16) * static_cast<uint32_t>(sizeof(float4)));
-                        *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
+                        if constexpr (kUseMXFP8Combine) {
+                            const uint32_t lane_idx_in_row = lane_idx % 16;
+                            const uint32_t col_group = lane_idx_in_row / 2;
+                            const auto smem_ptr = reinterpret_cast<uint8_t*>(shared_storage.smem_d.l2[epilogue_wg_idx]) +
+                                row_in_store * kSwizzleCDMode +
+                                (col_group ^ (row_in_atom / 2)) * kNumBankGroupBytes +
+                                (lane_idx_in_row % 2) * static_cast<uint32_t>(sizeof(uint2));
+                            const auto fp8x8 = ptx::ld_shared(reinterpret_cast<uint2*>(smem_ptr));
+                            const auto dst_ptr = math::advance_ptr<uint2>(
+                                dst_token.get_base_ptr(),
+                                n_idx + lane_idx_in_row * static_cast<uint32_t>(sizeof(uint2)));
+                            *sym_buffer.map(dst_ptr, dst_rank_idx) = fp8x8;
+
+                            if (lane_idx_in_row % 4 == 0) {
+                                const uint32_t sf_group_idx = lane_idx_in_row / 4;
+                                const auto sf_smem_base = reinterpret_cast<uint8_t*>(shared_storage.smem_d.l2[epilogue_wg_idx]) +
+                                    STORE_BLOCK_M * kSwizzleCDMode;
+                                const uint8_t sf_byte = ptx::ld_shared(
+                                    sf_smem_base + row_in_store * (BLOCK_N / kGranK) + sf_group_idx);
+                                const auto dst_sf_ptr = math::advance_ptr<uint8_t>(
+                                    dst_token.get_base_ptr(),
+                                    kHidden + (n_idx / kGranK + sf_group_idx) * static_cast<uint32_t>(sizeof(uint8_t)));
+                                *sym_buffer.map(dst_sf_ptr, dst_rank_idx) = sf_byte;
+                            }
+                        } else {
+                            const auto smem_ptr = reinterpret_cast<uint8_t*>(shared_storage.smem_d.l2[epilogue_wg_idx]) +
+                                (lane_idx % 16 / 8) * STORE_BLOCK_M * kSwizzleCDMode +
+                                row_in_store * kSwizzleCDMode +
+                                (bank_group_idx ^ row_in_atom) * kNumBankGroupBytes;
+                            const auto packed = ptx::ld_shared(reinterpret_cast<float4*>(smem_ptr));
+                            const auto dst_ptr = math::advance_ptr<float4>(
+                                dst_token.get_base_ptr(),
+                                n_idx * static_cast<uint32_t>(sizeof(nv_bfloat16)) + (lane_idx % 16) * static_cast<uint32_t>(sizeof(float4)));
+                            *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
+                        }
                     }
                 }
 
@@ -1349,8 +1440,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         // Combine: reduce top-k results and write back
         // NOTES: reuse shared memory from start up to the barriers
         // 1 token, 1 topk latency: ~3 us
-        constexpr uint32_t kNumHiddenBytes = kHidden * sizeof(nv_bfloat16);
-        constexpr uint32_t kNumElemsPerUint4 = sizeof(uint4) / sizeof(nv_bfloat162);
+        constexpr uint32_t kNumOutputBytes = kHidden * sizeof(nv_bfloat16);
+        constexpr uint32_t kNumOutputElemsPerUint4 = sizeof(uint4) / sizeof(nv_bfloat162);
+        constexpr uint32_t kNumFP8ElemsPerUint4 = sizeof(uint4);
+        constexpr uint32_t kNumFP8Float2PerUint4 = kNumFP8ElemsPerUint4 / 2;
 
         // 3 slots of chunk is needed: 2 load stages and 1 store
         constexpr uint32_t kNumChunkSlots = 3;
@@ -1359,25 +1452,35 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         // NOTES: either 1 or 2 chunks for simplicity
         // NOTES: Restrict on both smem and register
         constexpr uint32_t kNumChunks =
-            kNumChunkSlots * kNumEpilogueWarps * kNumHiddenBytes <= kNumReusableSmemBytes and kHidden <= 32 * kNumMaxRegistersForBuffer ? 1 : 2;
-        constexpr uint32_t kNumChunkBytes = kNumHiddenBytes / kNumChunks;
-        constexpr uint32_t kNumChunkUint4 = kNumChunkBytes / sizeof(uint4);
-        constexpr uint32_t kNumUint4PerLane = kNumChunkUint4 / 32;
+            kNumChunkSlots * kNumEpilogueWarps * kNumOutputBytes <= kNumReusableSmemBytes and kHidden <= 32 * kNumMaxRegistersForBuffer ? 1 : 2;
+        constexpr uint32_t kNumOutputChunkBytes = kNumOutputBytes / kNumChunks;
+        constexpr uint32_t kNumCombineChunkBytes = kCombineTokenDataBytes / kNumChunks;
+        constexpr uint32_t kNumCombineSFChunkBytes = kCombineTokenSFBytes / kNumChunks;
+        constexpr uint32_t kNumOutputChunkUint4 = kNumOutputChunkBytes / sizeof(uint4);
+        constexpr uint32_t kNumCombineChunkUint4 = kNumCombineChunkBytes / sizeof(uint4);
+        constexpr uint32_t kNumOutputUint4PerLane = kNumOutputChunkUint4 / 32;
+        constexpr uint32_t kNumCombineUint4PerLane = kNumCombineChunkUint4 / 32;
         DG_STATIC_ASSERT(kHidden % kNumChunks == 0, "Hidden must be divisible by number of chunks");
-        DG_STATIC_ASSERT(kNumChunkSlots * kNumEpilogueWarps * kNumHiddenBytes / kNumChunks <= kNumReusableSmemBytes, "Hidden is too large");
-        DG_STATIC_ASSERT(kNumChunkBytes % 16 == 0, "Combine chunk must be TMA-aligned (16 bytes)");
-        DG_STATIC_ASSERT(kNumChunkBytes % sizeof(uint4) == 0, "Combine chunk must be divisible by 16 bytes");
-        DG_STATIC_ASSERT(kNumChunkUint4 % 32 == 0, "Combine chunk must be a multiple of 32 16-byte elements (one per lane)");
+        DG_STATIC_ASSERT(kNumChunkSlots * kNumEpilogueWarps * kNumOutputChunkBytes <= kNumReusableSmemBytes, "Hidden is too large");
+        DG_STATIC_ASSERT(kNumOutputChunkBytes % 16 == 0, "Output chunk must be TMA-aligned (16 bytes)");
+        DG_STATIC_ASSERT(kNumCombineChunkBytes % 16 == 0, "Combine chunk must be TMA-aligned (16 bytes)");
+        DG_STATIC_ASSERT(kNumOutputChunkBytes % sizeof(uint4) == 0, "Output chunk must be divisible by 16 bytes");
+        DG_STATIC_ASSERT(kNumCombineChunkBytes % sizeof(uint4) == 0, "Combine chunk must be divisible by 16 bytes");
+        DG_STATIC_ASSERT(kNumOutputChunkUint4 % 32 == 0, "Output chunk must be a multiple of 32 16-byte elements (one per lane)");
+        DG_STATIC_ASSERT(kNumCombineChunkUint4 % 32 == 0, "Combine chunk must be a multiple of 32 16-byte elements (one per lane)");
+        DG_STATIC_ASSERT((not kUseMXFP8Combine) or kNumOutputUint4PerLane == kNumCombineUint4PerLane * 2,
+                         "MXFP8 reducer expects two BF16 output vectors per FP8 input vector");
+        DG_STATIC_ASSERT(kNumCombineSFChunkBytes == 0 or kNumCombineSFChunkBytes % 16 == 0, "MXFP8 SF chunk must be 16-byte aligned");
         DG_STATIC_ASSERT(kNumTopk <= 32, "Top-k must fit in a single warp");
 
         // Verify combined shared memory budget at runtime
-        DG_DEVICE_ASSERT(kNumChunkSlots * kNumEpilogueWarps * kNumChunkBytes <= kNumReusableSmemBytes);
+        DG_DEVICE_ASSERT(kNumChunkSlots * kNumEpilogueWarps * kNumOutputChunkBytes <= kNumReusableSmemBytes);
 
         // Per-warp buffer: 2 stage load buffers + 1 store buffer
         const auto combine_load_buffer = utils::PatternVisitor([&](const uint32_t& i) {
-            return math::advance_ptr<uint4>(smem_buffer, (epilogue_warp_idx + i * kNumEpilogueWarps) * kNumChunkBytes);
+            return math::advance_ptr<uint4>(smem_buffer, (epilogue_warp_idx + i * kNumEpilogueWarps) * kNumOutputChunkBytes);
         });
-        const auto combine_store_buffer  = math::advance_ptr<uint4>(smem_buffer, (epilogue_warp_idx + kNumEpilogueWarps * 2) * kNumChunkBytes);
+        const auto combine_store_buffer  = math::advance_ptr<uint4>(smem_buffer, (epilogue_warp_idx + kNumEpilogueWarps * 2) * kNumOutputChunkBytes);
 
         // Per-warp barriers
         auto combine_load_barriers = utils::PatternVisitor([&](const uint32_t& i) {
@@ -1387,6 +1490,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         // Iterate over all tokens
         uint32_t combine_phase = 0;
         uint32_t load_stage_idx = 0;
+        uint32_t loaded_slot_idx[2] = {};
         for (uint32_t token_idx = sm_idx * kNumEpilogueWarps + epilogue_warp_idx;
              token_idx < num_tokens;
              token_idx += kNumSMs * kNumEpilogueWarps) {
@@ -1398,7 +1502,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
             // Iterate all chunks
             for (uint32_t chunk = 0; chunk < kNumChunks; ++ chunk) {
-                const uint32_t chunk_byte_offset = chunk * kNumChunkBytes;
+                const uint32_t combine_chunk_byte_offset = chunk * kNumCombineChunkBytes;
+                const uint32_t combine_sf_chunk_byte_offset = chunk * kNumCombineSFChunkBytes;
+                const uint32_t output_chunk_byte_offset = chunk * kNumOutputChunkBytes;
 
                 // Move mask and load
                 uint32_t mask = total_mask;
@@ -1407,15 +1513,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         // Move
                         const uint32_t slot_idx = __ffs(mask) - 1;
                         mask ^= 1 << slot_idx;
+                        loaded_slot_idx[i] = slot_idx;
 
                         // Load
                         if (cute::elect_one_sync()) {
                             const auto src_ptr = math::advance_ptr<uint8_t>(
                                 combine_token_buffer.get_rank_buffer(slot_idx)
                                                     .get_data_buffer(token_idx).get_base_ptr(),
-                                chunk_byte_offset);
-                            ptx::tma_load_1d(combine_load_buffer[i], src_ptr, combine_load_barriers[i], kNumChunkBytes);
-                            ptx::mbarrier_arrive_and_set_tx(combine_load_barriers[i], kNumChunkBytes);
+                                combine_chunk_byte_offset);
+                            ptx::tma_load_1d(combine_load_buffer[i], src_ptr, combine_load_barriers[i], kNumCombineChunkBytes);
+                            ptx::mbarrier_arrive_and_set_tx(combine_load_barriers[i], kNumCombineChunkBytes);
                         }
                         __syncwarp();
                         return true;
@@ -1427,41 +1534,84 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 bool do_reduce = move_mask_and_load(load_stage_idx);
 
                 // Accumulate all top-k contributions for this chunk in float registers
-                float2 reduced[kNumUint4PerLane * kNumElemsPerUint4] = {};
+                float2 reduced[kNumOutputUint4PerLane * kNumOutputElemsPerUint4] = {};
                 while (do_reduce) {
                     // Prefetch next top-k into the buffer while current is being accumulated
                     do_reduce = move_mask_and_load(load_stage_idx ^ 1);
 
                     // Accumulate
                     combine_load_barriers[load_stage_idx]->wait(combine_phase);
-                    #pragma unroll
-                    for (uint32_t j = 0; j < kNumUint4PerLane; ++ j) {
-                        const auto uint4_values = combine_load_buffer[load_stage_idx][j * 32 + lane_idx];
-                        const auto bf16_values = reinterpret_cast<const nv_bfloat162*>(&uint4_values);
+                    if constexpr (kUseMXFP8Combine) {
+                        const auto src_token_base = combine_token_buffer
+                            .get_rank_buffer(loaded_slot_idx[load_stage_idx])
+                            .get_data_buffer(token_idx)
+                            .get_base_ptr<uint8_t>();
                         #pragma unroll
-                        for (uint32_t l = 0; l < kNumElemsPerUint4; ++ l)
-                            ptx::accumulate(reduced[j * kNumElemsPerUint4 + l], bf16_values[l]);
+                        for (uint32_t j = 0; j < kNumCombineUint4PerLane; ++ j) {
+                            const auto uint4_values = combine_load_buffer[load_stage_idx][j * 32 + lane_idx];
+                            const auto fp8_values = reinterpret_cast<const cutlass::float_e4m3_t*>(&uint4_values);
+                            const uint32_t sf_idx = combine_sf_chunk_byte_offset + j * 16 + lane_idx / 2;
+                            const float sf = math::cast_ue8m0_to_float(*(src_token_base + kHidden + sf_idx));
+                            #pragma unroll
+                            for (uint32_t l = 0; l < kNumFP8Float2PerUint4; ++ l) {
+                                auto& value = reduced[j * kNumFP8Float2PerUint4 + l];
+                                value.x += static_cast<float>(fp8_values[l * 2 + 0]) * sf;
+                                value.y += static_cast<float>(fp8_values[l * 2 + 1]) * sf;
+                            }
+                        }
+                    } else {
+                        #pragma unroll
+                        for (uint32_t j = 0; j < kNumOutputUint4PerLane; ++ j) {
+                            const auto uint4_values = combine_load_buffer[load_stage_idx][j * 32 + lane_idx];
+                            const auto bf16_values = reinterpret_cast<const nv_bfloat162*>(&uint4_values);
+                            #pragma unroll
+                            for (uint32_t l = 0; l < kNumOutputElemsPerUint4; ++ l)
+                                ptx::accumulate(reduced[j * kNumOutputElemsPerUint4 + l], bf16_values[l]);
+                        }
                     }
                     combine_phase ^= load_stage_idx;
                     load_stage_idx ^= 1;
                 }
 
-                // Cast
-                #pragma unroll
-                for (uint32_t j = 0; j < kNumUint4PerLane; ++ j) {
-                    uint4 casted;
-                    auto casted_bf16 = reinterpret_cast<nv_bfloat162*>(&casted);
+                // Cast and store into the linear BF16 output chunk.
+                if constexpr (kUseMXFP8Combine) {
                     #pragma unroll
-                    for (uint32_t l = 0; l < kNumElemsPerUint4; ++ l)
-                        casted_bf16[l] = __float22bfloat162_rn(reduced[j * kNumElemsPerUint4 + l]);
+                    for (uint32_t j = 0; j < kNumCombineUint4PerLane; ++ j) {
+                        #pragma unroll
+                        for (uint32_t half = 0; half < 2; ++ half) {
+                            uint4 casted;
+                            auto casted_bf16 = reinterpret_cast<nv_bfloat162*>(&casted);
+                            #pragma unroll
+                            for (uint32_t l = 0; l < kNumOutputElemsPerUint4; ++ l)
+                                casted_bf16[l] = __float22bfloat162_rn(
+                                    reduced[j * kNumFP8Float2PerUint4 + half * kNumOutputElemsPerUint4 + l]);
 
-                    // Wait share memory release and write
-                    if (j == 0) {
-                        ptx::tma_store_wait<0>();
-                        __syncwarp();
+                            // Wait shared memory release and write.
+                            if (j == 0 and half == 0) {
+                                ptx::tma_store_wait<0>();
+                                __syncwarp();
+                            }
+                            ptx::st_shared(combine_store_buffer + j * 64 + lane_idx * 2 + half,
+                                           casted.x, casted.y, casted.z, casted.w);
+                        }
                     }
-                    ptx::st_shared(combine_store_buffer + j * 32 + lane_idx,
-                                   casted.x, casted.y, casted.z, casted.w);
+                } else {
+                    #pragma unroll
+                    for (uint32_t j = 0; j < kNumOutputUint4PerLane; ++ j) {
+                        uint4 casted;
+                        auto casted_bf16 = reinterpret_cast<nv_bfloat162*>(&casted);
+                        #pragma unroll
+                        for (uint32_t l = 0; l < kNumOutputElemsPerUint4; ++ l)
+                            casted_bf16[l] = __float22bfloat162_rn(reduced[j * kNumOutputElemsPerUint4 + l]);
+
+                        // Wait shared memory release and write.
+                        if (j == 0) {
+                            ptx::tma_store_wait<0>();
+                            __syncwarp();
+                        }
+                        ptx::st_shared(combine_store_buffer + j * 32 + lane_idx,
+                                       casted.x, casted.y, casted.z, casted.w);
+                    }
                 }
                 __syncwarp();
 
@@ -1469,8 +1619,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 if (cute::elect_one_sync()) {
                     cute::tma_store_fence();
                     ptx::tma_store_1d(
-                        math::advance_ptr(y, static_cast<uint64_t>(token_idx) * kNumHiddenBytes + chunk_byte_offset),
-                        combine_store_buffer, kNumChunkBytes);
+                        math::advance_ptr(y, static_cast<uint64_t>(token_idx) * kNumOutputBytes + output_chunk_byte_offset),
+                        combine_store_buffer, kNumOutputChunkBytes);
                     cute::tma_store_arrive();
                 }
                 __syncwarp();

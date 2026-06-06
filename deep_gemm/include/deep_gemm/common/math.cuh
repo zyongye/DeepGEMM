@@ -112,6 +112,15 @@ CUTLASS_DEVICE void get_e4m3_sf_and_sf_inv(const float2& amax, float2& sf, float
     sf.y = fast_pow2(exp_y), sf_inv.y = fast_pow2(-exp_y);
 }
 
+CUTLASS_DEVICE void get_e4m3_sf_and_sf_inv(const float& amax, float& sf, float& sf_inv) {
+    const auto exp = fast_log2_ceil(amax / 448.0f);
+    sf = fast_pow2(exp), sf_inv = fast_pow2(-exp);
+}
+
+CUTLASS_DEVICE float cast_ue8m0_to_float(const uint8_t& sf) {
+    return fast_pow2(static_cast<int>(sf) - 127);
+}
+
 template <bool kUseUE8M0 = true>
 CUTLASS_DEVICE void get_e2m1_sf_and_sf_inv(const float2& amax, float2& sf, float2& sf_inv) {
     DG_STATIC_ASSERT(kUseUE8M0, "Must use UE8M0");
@@ -140,6 +149,17 @@ CUTLASS_DEVICE uint32_t cast_into_e2m1_code(const float& value) {
 
 CUTLASS_DEVICE uint32_t cvt_pack_f32_to_e2m1x2(const float& a, const float& b) {
     return cast_into_e2m1_code(a) | (cast_into_e2m1_code(b) << 4);
+}
+
+CUTLASS_DEVICE uint32_t cvt_pack_f32_to_e4m3x4(const float4& values) {
+    uint16_t lo, hi;
+    asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %2, %1;\n"
+                 : "=h"(lo)
+                 : "f"(values.x), "f"(values.y));
+    asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %2, %1;\n"
+                 : "=h"(hi)
+                 : "f"(values.z), "f"(values.w));
+    return static_cast<uint32_t>(lo) | (static_cast<uint32_t>(hi) << 16);
 }
 
 /// Reduction

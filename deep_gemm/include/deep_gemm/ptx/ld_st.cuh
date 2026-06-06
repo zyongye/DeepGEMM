@@ -104,6 +104,12 @@ CUTLASS_DEVICE uint32_t ld_shared(const uint32_t* ptr) {
     return ret;
 }
 
+CUTLASS_DEVICE uint8_t ld_shared(const uint8_t* ptr) {
+    uint32_t ret;
+    asm volatile("ld.shared.u8 %0, [%1];" : "=r"(ret) : "l"(__cvta_generic_to_shared(ptr)));
+    return static_cast<uint8_t>(ret);
+}
+
 CUTLASS_DEVICE float2 ld_shared(const float2* ptr) {
     float2 ret;
     asm volatile("ld.shared.v2.f32 {%0, %1}, [%2];" : "=f"(ret.x), "=f"(ret.y) : "l"(__cvta_generic_to_shared(ptr)));
@@ -119,6 +125,12 @@ CUTLASS_DEVICE float4 ld_shared(const float4* ptr) {
 CUTLASS_DEVICE uint4 ld_shared(const uint4* ptr) {
     uint4 ret;
     asm volatile("ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];" : "=r"(ret.x), "=r"(ret.y), "=r"(ret.z), "=r"(ret.w) : "l"(__cvta_generic_to_shared(ptr)));
+    return ret;
+}
+
+CUTLASS_DEVICE uint2 ld_shared(const uint2* ptr) {
+    uint2 ret;
+    asm volatile("ld.shared.v2.u32 {%0, %1}, [%2];" : "=r"(ret.x), "=r"(ret.y) : "l"(__cvta_generic_to_shared(ptr)));
     return ret;
 }
 
@@ -138,6 +150,10 @@ CUTLASS_DEVICE void st_shared(const float2* ptr, float2 val) {
 
 CUTLASS_DEVICE void st_shared(const uint32_t* ptr, uint32_t val) {
     asm volatile("st.shared.u32 [%0], %1;" :: "l"(__cvta_generic_to_shared(ptr)), "r"(val));
+}
+
+CUTLASS_DEVICE void st_shared(const uint8_t* ptr, uint8_t val) {
+    asm volatile("st.shared.u8 [%0], %1;" :: "l"(__cvta_generic_to_shared(ptr)), "r"(static_cast<uint32_t>(val)));
 }
 
 CUTLASS_DEVICE void st_shared(const void* ptr, uint32_t x, uint32_t y) {

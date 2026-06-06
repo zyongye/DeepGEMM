@@ -54,7 +54,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         group, num_experts,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
-        activation_dtype=args.activation_dtype
+        activation_dtype=args.activation_dtype,
+        combine_dtype=args.combine_dtype
     )
 
     # Cast weights into FP4
@@ -113,6 +114,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             sym_buffer=buffer,
             cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats_fused,
             activation_dtype=args.activation_dtype,
+            combine_dtype=args.combine_dtype,
             activation_clamp=args.activation_clamp,
             fast_math=bool(args.fast_math),
             use_mxf4_kind=bool(args.use_mxf4_kind))
@@ -125,6 +127,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     dist_print(f' > Intermediate: {intermediate_hidden}', once_in_node=True)
     dist_print(f' > Experts: {num_topk}/{num_experts}', once_in_node=True)
     dist_print(f' > Activation dtype: {args.activation_dtype}, MXF4 kind: {bool(args.use_mxf4_kind)}', once_in_node=True)
+    dist_print(f' > Combine dtype: {args.combine_dtype}', once_in_node=True)
     dist_print(f' > Buffer: {buffer.buffer.nbytes / 2 ** 30:.3f} GiB', once_in_node=True)
     dist_print(once_in_node=True)
 
@@ -193,15 +196,22 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             # Combine
             return ep_buffer.combine(l2_y, handle=handle)[0], cumulative_local_expert_recv_stats_baseline
 
-    # Check correctness (must be bitwise identical)
+    # Check correctness
     num_correctness_tests = 1 if args.num_correctness_tests is None else args.num_correctness_tests
     # noinspection PyBroadException
     if is_legacy_loaded and num_correctness_tests > 0:
         dist_print('Running correctness tests:', once_in_node=True)
         for i in range(num_correctness_tests):
             create_inputs()
-            for fused_result, baseline_result in zip(run_fused(), run_baseline()):
-                assert torch.equal(fused_result, baseline_result)
+            fused_y, fused_stats = run_fused()
+            baseline_y, baseline_stats = run_baseline()
+            if args.combine_dtype == 'bf16':
+                assert torch.equal(fused_y, baseline_y)
+            else:
+                diff_norm = torch.linalg.vector_norm(fused_y.float() - baseline_y.float())
+                base_norm = torch.linalg.vector_norm(baseline_y.float()).clamp_min(1e-6)
+                assert (diff_norm / base_norm).item() < 0.08
+            assert torch.equal(fused_stats, baseline_stats)
             if (i + 1) % 100 == 0 or i == num_correctness_tests - 1:
                 dist_print(f' > Correctness test #{i + 1}/{num_correctness_tests} passed', once_in_node=True)
         dist_print(once_in_node=True)
@@ -227,6 +237,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     # HBM bytes: weights + activations + output
     activation_bytes = 0.5 if args.activation_dtype == 'mxfp4' else 1
+    combine_bytes = hidden * (1 + 1 / 32) if args.combine_dtype == 'mxfp8' else hidden * 2
     num_touched_experts = torch.unique(gathered_topk_idx[gathered_topk_idx >= 0]).numel()
     num_hbm_bytes = (
         num_touched_experts * intermediate_hidden * 2 * hidden * 0.5                                 # L1 weights
@@ -234,16 +245,16 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         + num_recv_tokens * hidden * activation_bytes                                                # L1 acts read
         + num_recv_tokens * intermediate_hidden * activation_bytes                                   # L1 output write
         + num_recv_tokens * intermediate_hidden * activation_bytes                                   # L2 acts read
-        + num_recv_tokens * hidden * 2                                                               # L2 output write (always BF16)
+        + num_recv_tokens * combine_bytes                                                            # L2 output write for combine
     )
     hbm_gbs = safe_div(num_hbm_bytes / 1e9, t_fused)
 
     # NVLink bytes: dispatch pull + combine write-back
-    num_nvlink_bytes = num_recv_tokens * (hidden * activation_bytes + hidden * 2)
+    num_nvlink_bytes = num_recv_tokens * (hidden * activation_bytes + combine_bytes)
     nvlink_gbs = safe_div(num_nvlink_bytes / 1e9, t_fused)
 
     # Combine reduction (serial) time approximation
-    t_reduction = num_tokens * hidden * 2 * (1 + num_topk) / 6.5e12
+    t_reduction = num_tokens * (combine_bytes * num_topk + hidden * 2) / 6.5e12
 
     # Summary
     approx_factor = t_fused / (t_fused - t_reduction)
@@ -281,6 +292,8 @@ if __name__ == '__main__':
     parser.add_argument('--activation-clamp', type=float, default=10, help='Clamp value for activation')
     parser.add_argument('--activation-dtype', type=str, default='fp8', choices=['fp8', 'mxfp4'],
                         help='Activation storage for input and post-SwiGLU activations')
+    parser.add_argument('--combine-dtype', type=str, default='bf16', choices=['bf16', 'mxfp8'],
+                        help='Cross-rank combine payload storage')
     parser.add_argument('--use-mxf4-kind', type=int, default=0,
                         help='Use native SM100 kind::mxf4 for MXFP4 activations (0 or 1, default: 0)')
     parser.add_argument('--num-experts', type=int, default=384, help='Number of experts')

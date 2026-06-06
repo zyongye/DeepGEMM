@@ -21,8 +21,10 @@ class SymmBuffer:
                  hidden: int, intermediate_hidden: int,
                  use_fp8_dispatch: bool = True,
                  activation: str = 'swiglu',
-                 activation_dtype: str = 'fp8'):
+                 activation_dtype: str = 'fp8',
+                 combine_dtype: str = 'bf16'):
         assert activation_dtype in ('fp8', 'mxfp4')
+        assert combine_dtype in ('bf16', 'mxfp8')
         self.group = group
         self.num_experts = num_experts
         self.num_max_tokens_per_rank = num_max_tokens_per_rank
@@ -30,13 +32,14 @@ class SymmBuffer:
         self.hidden = hidden
         self.intermediate_hidden = intermediate_hidden
         self.activation_dtype = activation_dtype
+        self.combine_dtype = combine_dtype
 
         # Allocate a symmetric buffer
         num_bytes, slice_input_buffers = _C.get_symm_buffer_size_for_mega_moe(
             group.size(), num_experts,
             num_max_tokens_per_rank, num_topk,
             hidden, intermediate_hidden,
-            use_fp8_dispatch, activation, activation_dtype
+            use_fp8_dispatch, activation, activation_dtype, combine_dtype
         )
         allocator = torch if group.size() == 1 else symm_mem
         self.buffer = allocator.empty(num_bytes, dtype=torch.int8, device='cuda')
@@ -69,7 +72,8 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
                                  hidden: int, intermediate_hidden: int,
                                  use_fp8_dispatch: bool = True,
                                  activation: str = 'swiglu',
-                                 activation_dtype: str = 'fp8') -> SymmBuffer:
+                                 activation_dtype: str = 'fp8',
+                                 combine_dtype: str = 'bf16') -> SymmBuffer:
     # Token count must be aligned to block sizes
     num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe())
 
@@ -77,7 +81,7 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
         group, num_experts,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
-        use_fp8_dispatch, activation, activation_dtype
+        use_fp8_dispatch, activation, activation_dtype, combine_dtype
     )
 
 
@@ -120,11 +124,14 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      recipe: Tuple[int, int, int] = (1, 1, 32),
                      activation: str = 'swiglu',
                      activation_dtype: Optional[str] = None,
+                     combine_dtype: Optional[str] = None,
                      activation_clamp: Optional[float] = None,
                      fast_math: bool = True,
                      use_mxf4_kind: bool = False):
     activation_dtype = sym_buffer.activation_dtype if activation_dtype is None else activation_dtype
+    combine_dtype = sym_buffer.combine_dtype if combine_dtype is None else combine_dtype
     assert activation_dtype == sym_buffer.activation_dtype
+    assert combine_dtype == sym_buffer.combine_dtype
     assert (not use_mxf4_kind) or activation_dtype == 'mxfp4'
     _C.fp8_fp4_mega_moe(
         y,
@@ -135,6 +142,6 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         sym_buffer.num_max_tokens_per_rank,
         sym_buffer.num_experts, sym_buffer.num_topk,
         recipe,
-        activation, activation_dtype, activation_clamp,
+        activation, activation_dtype, combine_dtype, activation_clamp,
         fast_math, use_mxf4_kind
     )
