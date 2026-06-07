@@ -335,8 +335,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t kAfterWorkspaceCleanBarrierTag = 3;
 
     // Adjust registers
-    // NOTES: more experts per rank will cost more schedulers' registers
-    constexpr bool kUseMoreEpilogueRegisters = kNumExpertsPerRank <= 64;
+    // Native MXF4 spends more pressure in the epilogue/quant path; keep the
+    // larger epilogue register partition even for wide expert shards.
+    constexpr bool kUseMoreEpilogueRegisters = kUseMxf4Kind or kNumExpertsPerRank <= 64;
     constexpr uint32_t kNumDispatchRegisters = kUseMoreEpilogueRegisters ? 48 : 96;
     constexpr uint32_t kNumNonEpilogueRegisters = kUseMoreEpilogueRegisters ? 40 : 88;
     constexpr uint32_t kNumEpilogueRegisters = kUseMoreEpilogueRegisters ? 208 : 160;
