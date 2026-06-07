@@ -237,7 +237,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     # HBM bytes: weights + activations + output
     activation_bytes = 0.5 if args.activation_dtype == 'mxfp4' else 1
-    combine_bytes = hidden * (1 + 1 / 32) if args.combine_dtype == 'mxfp8' else hidden * 2
+    combine_bytes = hidden * 2
     num_touched_experts = torch.unique(gathered_topk_idx[gathered_topk_idx >= 0]).numel()
     num_hbm_bytes = (
         num_touched_experts * intermediate_hidden * 2 * hidden * 0.5                                 # L1 weights
@@ -292,7 +292,7 @@ if __name__ == '__main__':
     parser.add_argument('--activation-clamp', type=float, default=10, help='Clamp value for activation')
     parser.add_argument('--activation-dtype', type=str, default='fp8', choices=['fp8', 'mxfp4'],
                         help='Activation storage for input and post-SwiGLU activations')
-    parser.add_argument('--combine-dtype', type=str, default='bf16', choices=['bf16', 'mxfp8'],
+    parser.add_argument('--combine-dtype', type=str, default='bf16', choices=['bf16'],
                         help='Cross-rank combine payload storage')
     parser.add_argument('--use-mxf4-kind', type=int, default=0,
                         help='Use native SM100 kind::mxf4 for MXFP4 activations (0 or 1, default: 0)')

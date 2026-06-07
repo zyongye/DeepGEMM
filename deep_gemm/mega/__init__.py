@@ -24,7 +24,7 @@ class SymmBuffer:
                  activation_dtype: str = 'fp8',
                  combine_dtype: str = 'bf16'):
         assert activation_dtype in ('fp8', 'mxfp4')
-        assert combine_dtype in ('bf16', 'mxfp8')
+        assert combine_dtype == 'bf16'
         self.group = group
         self.num_experts = num_experts
         self.num_max_tokens_per_rank = num_max_tokens_per_rank
@@ -132,6 +132,7 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
     combine_dtype = sym_buffer.combine_dtype if combine_dtype is None else combine_dtype
     assert activation_dtype == sym_buffer.activation_dtype
     assert combine_dtype == sym_buffer.combine_dtype
+    assert combine_dtype == 'bf16'
     assert (not use_mxf4_kind) or activation_dtype == 'mxfp4'
     _C.fp8_fp4_mega_moe(
         y,
