@@ -181,7 +181,7 @@ static void sm100_fp8_fp4_mega_moe(
     // NOTES: L1 output and L2 activations are essentially the same tensor.
     // Post-SwiGLU output N width is `BLOCK_N / 2` per input tile.
     const auto tensor_map_l1_output = use_fp4_activations
-        ? make_tma_2d_desc(l2_acts.view(torch::kUInt8),
+        ? make_tma_2d_desc(l2_acts,
                            intermediate_hidden / 2, config.num_max_pool_tokens,
                            config.block_n / 4, config.store_block_m,
                            static_cast<int>(l2_acts.stride(-2)),
@@ -191,13 +191,21 @@ static void sm100_fp8_fp4_mega_moe(
                            config.block_n / 2, config.store_block_m,
                            static_cast<int>(l2_acts.stride(-2)),
                            config.swizzle_acts_mode / 2);
-    const auto tensor_map_l2_acts = make_tma_2d_desc(l2_acts,
-                                                     intermediate_hidden, config.num_max_pool_tokens,
-                                                     config.block_k, config.load_block_m,
-                                                     static_cast<int>(l2_acts.stride(-2)),
-                                                     swizzle_acts, /*swizzle_base=*/0,
-                                                     /*allow_tf32=*/false,
-                                                     /*fp4_unpacked_smem=*/fp4_unpacked_smem);
+    const auto tensor_map_l2_acts = use_fp4_activations
+        ? make_tma_2d_desc(l2_acts.view(kPackedFP4),
+                           intermediate_hidden, config.num_max_pool_tokens,
+                           config.block_k, config.load_block_m,
+                           static_cast<int>(l2_acts.stride(-2)),
+                           swizzle_acts, /*swizzle_base=*/0,
+                           /*allow_tf32=*/false,
+                           /*fp4_unpacked_smem=*/fp4_unpacked_smem)
+        : make_tma_2d_desc(l2_acts,
+                           intermediate_hidden, config.num_max_pool_tokens,
+                           config.block_k, config.load_block_m,
+                           static_cast<int>(l2_acts.stride(-2)),
+                           swizzle_acts, /*swizzle_base=*/0,
+                           /*allow_tf32=*/false,
+                           /*fp4_unpacked_smem=*/fp4_unpacked_smem);
     const auto tensor_map_l2_acts_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l2_acts_sf,
                                                         config.num_padded_sf_pool_tokens, intermediate_hidden,
                                                         config.sf_block_m, kGranK,

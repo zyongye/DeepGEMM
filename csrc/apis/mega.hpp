@@ -39,8 +39,10 @@ get_symm_buffer_size_for_mega_moe(
     const auto activation_token_layout = layout::Data(use_fp4_activations ? hidden / 2 : hidden);
     const auto bf16_token_layout = layout::Data(hidden * 2);
     const auto mxfp8_token_layout = layout::Data(hidden + hidden / 32);
-    const auto intermediate_activation_token_layout = layout::Data(
-        use_fp4_activations ? intermediate_hidden / 2 : intermediate_hidden);
+    // Keep the L2 activation row pitch at the FP8 width. FP4 payload still
+    // occupies the first half of each row, and the L2 TMA descriptor views it
+    // as packed FP4; the wider pitch is faster for native MXF4.
+    const auto intermediate_activation_token_layout = layout::Data(intermediate_hidden);
     const auto fp8_sf_layout = layout::Data(hidden / 32);
     const auto fp8_intermediate_sf_layout = layout::Data(intermediate_hidden / 32);
     const auto input_topk_idx_layout = layout::Data(num_topk * sizeof(int64_t), false);
@@ -130,8 +132,8 @@ get_symm_buffer_size_for_mega_moe(
             torch::TensorOptions().dtype(torch::kInt).device(buffer.device()));
         auto l2_acts = torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(l2_token_buffer.base)),
-            {num_max_pool_tokens, use_fp4_activations ? intermediate_hidden / 2 : intermediate_hidden},
-            torch::TensorOptions().dtype(activation_torch_dtype).device(buffer.device()));
+            {num_max_pool_tokens, intermediate_hidden},
+            torch::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(buffer.device()));
         auto l2_acts_sf = torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(l2_sf_buffer.base)),
             {num_max_padded_sf_pool_tokens, intermediate_hidden / 128},

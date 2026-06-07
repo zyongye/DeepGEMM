@@ -235,9 +235,11 @@ static MegaMoEConfig get_mega_moe_config(
 
     // Waves
     const int num_sms = device_runtime->get_num_sms();
-    const int num_experts_per_wave = get_num_experts_per_wave_for_mega_moe(
+    int num_experts_per_wave = get_num_experts_per_wave_for_mega_moe(
         num_experts_per_rank, num_tokens, num_topk,
         intermediate_hidden, block_m, block_n, num_sms);
+    if (use_mxf4_kind and block_m == 192)
+        num_experts_per_wave = std::max(num_experts_per_wave, 8);
 
     // Thread layout
     const int num_dispatch_threads = 128;

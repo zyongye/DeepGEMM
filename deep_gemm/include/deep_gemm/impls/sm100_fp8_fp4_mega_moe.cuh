@@ -105,7 +105,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // Token and buffer layouts
     constexpr uint32_t kGranK = 32;
     constexpr uint32_t kInputTokenBytes = kUseFP4Activations ? kHidden / 2 : kHidden;
-    constexpr uint32_t kIntermediateTokenBytes = kUseFP4Activations ? kIntermediateHidden / 2 : kIntermediateHidden;
+    constexpr uint32_t kIntermediateTokenBytes = kIntermediateHidden;
     constexpr uint32_t kCombineTokenDataBytes = kUseMXFP8Combine ? kHidden : kHidden * sizeof(nv_bfloat16);
     constexpr uint32_t kCombineTokenSFBytes = kUseMXFP8Combine ? kHidden / kGranK : 0;
     constexpr auto activation_token_layout = layout::Data(kInputTokenBytes);
@@ -1514,7 +1514,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         // Move
                         const uint32_t slot_idx = __ffs(mask) - 1;
                         mask ^= 1 << slot_idx;
-                        loaded_slot_idx[i] = slot_idx;
+                        if constexpr (kUseMXFP8Combine)
+                            loaded_slot_idx[i] = slot_idx;
 
                         // Load
                         if (cute::elect_one_sync()) {
