@@ -15,6 +15,29 @@
 
 namespace deep_gemm {
 
+// Mega-only SF TMA descriptor supporting smem_outer_dim > 1 — needed by the block_k=256 tier, where
+// each K-block's SF spans block_k/128 = 2 outer chunks of 128. The shared make_tma_sf_desc hard-codes
+// smem_outer_dim = 1 (block_k=128 only); rather than touch shared infra we call the shared
+// make_tma_2d_desc directly here. Identical to make_tma_sf_desc except the smem_outer_dim passthrough.
+static CUtensorMap make_tma_sf_desc_mega(const cute::UMMA::Major& major,
+                                         const torch::Tensor& t,
+                                         int shape_mn, int shape_k,
+                                         const int& block_mn, const int& gran_k,
+                                         const int& num_groups,
+                                         const int& swizzle_mode, const int& swizzle_base,
+                                         const bool& allow_tf32,
+                                         const int& smem_outer_dim) {
+    DG_HOST_ASSERT(major == cute::UMMA::Major::MN);
+    DG_HOST_ASSERT(swizzle_mode == 0);
+    shape_mn = get_tma_aligned_size(shape_mn, static_cast<int>(t.element_size()));
+    return make_tma_2d_desc(t,
+                            shape_mn, ceil_div(shape_k, gran_k * (t.scalar_type() == torch::kFloat ? 1 : 4)) * num_groups,
+                            block_mn, smem_outer_dim,
+                            shape_mn,
+                            swizzle_mode, swizzle_base,
+                            allow_tf32);
+}
+
 class SM100FP8FP4MegaMoERuntime final : public LaunchRuntime<SM100FP8FP4MegaMoERuntime> {
 public:
     struct Args {
@@ -75,6 +98,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
         {}
     >);
 }};
@@ -88,6 +112,7 @@ static void __instantiate_kernel() {{
     args.config.num_max_pool_tokens,
     args.config.num_padded_sf_pool_tokens,
     args.config.num_stages,
+    args.config.num_bytes_per_pull,
     args.config.num_dispatch_threads, args.config.num_non_epilogue_threads, args.config.num_epilogue_threads,
     args.launch_args.grid_dim.first, args.num_ranks,
     to_string(args.activation_clamp),
@@ -148,6 +173,7 @@ static void sm100_fp8_fp4_mega_moe(
 
     // Make tensormap
     constexpr int kGranK = 32;
+    const int sf_smem_outer_dim = config.block_k / (kGranK * 4);
     const bool fp4_unpacked_smem = !use_mxf4_kind;
     const int swizzle_acts_mode = use_mxf4_kind ? config.block_k / 2 : config.swizzle_acts_mode;
     const int swizzle_weights_mode = use_mxf4_kind ? config.block_k / 2 : config.swizzle_weights_mode;
@@ -158,10 +184,11 @@ static void sm100_fp8_fp4_mega_moe(
                                                      swizzle_acts_mode, /*swizzle_base=*/0,
                                                      /*allow_tf32=*/false,
                                                      /*fp4_unpacked_smem=*/fp4_unpacked_smem);
-    const auto tensor_map_l1_acts_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l1_acts_sf,
+    const auto tensor_map_l1_acts_sf = make_tma_sf_desc_mega(cute::UMMA::Major::MN, l1_acts_sf,
                                                         config.num_padded_sf_pool_tokens, hidden,
                                                         config.sf_block_m, kGranK,
-                                                        1, 0);
+                                                        1, 0, 0, false,
+                                                        sf_smem_outer_dim);
     const auto tensor_map_l1_weights = make_tma_2d_desc(l1_weights,
                                                         hidden, num_experts_per_rank * intermediate_hidden * 2,
                                                         config.block_k, config.load_block_n,
@@ -169,10 +196,11 @@ static void sm100_fp8_fp4_mega_moe(
                                                         swizzle_weights_mode, /*swizzle_base=*/0,
                                                         /*allow_tf32=*/false,
                                                         /*fp4_unpacked_smem=*/fp4_unpacked_smem);
-    const auto tensor_map_l1_weights_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l1_weights_sf,
+    const auto tensor_map_l1_weights_sf = make_tma_sf_desc_mega(cute::UMMA::Major::MN, l1_weights_sf,
                                                            intermediate_hidden * 2, hidden,
                                                            config.block_n, kGranK,
-                                                           num_experts_per_rank, 0);
+                                                           num_experts_per_rank, 0, 0, false,
+                                                        sf_smem_outer_dim);
     // NOTES: L1 output and L2 activations are essentially the same tensor.
     // Post-SwiGLU output N width is `BLOCK_N / 2` per input tile.
     // For FP4 acts the L1 epilogue emits packed E2M1 in a canonical dense smem layout.
@@ -208,10 +236,11 @@ static void sm100_fp8_fp4_mega_moe(
                                                      swizzle_acts_mode, /*swizzle_base=*/0,
                                                      /*allow_tf32=*/false,
                                                      /*fp4_unpacked_smem=*/fp4_unpacked_smem);
-    const auto tensor_map_l2_acts_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l2_acts_sf,
+    const auto tensor_map_l2_acts_sf = make_tma_sf_desc_mega(cute::UMMA::Major::MN, l2_acts_sf,
                                                         config.num_padded_sf_pool_tokens, intermediate_hidden,
                                                         config.sf_block_m, kGranK,
-                                                        1, 0);
+                                                        1, 0, 0, false,
+                                                        sf_smem_outer_dim);
     const auto tensor_map_l2_weights = make_tma_2d_desc(l2_weights,
                                                         intermediate_hidden, num_experts_per_rank * hidden,
                                                         config.block_k, config.load_block_n,
@@ -219,10 +248,11 @@ static void sm100_fp8_fp4_mega_moe(
                                                         swizzle_weights_mode, /*swizzle_base=*/0,
                                                         /*allow_tf32=*/false,
                                                         /*fp4_unpacked_smem=*/fp4_unpacked_smem);
-    const auto tensor_map_l2_weights_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l2_weights_sf,
+    const auto tensor_map_l2_weights_sf = make_tma_sf_desc_mega(cute::UMMA::Major::MN, l2_weights_sf,
                                                            hidden, intermediate_hidden,
                                                            config.block_n, kGranK,
-                                                           num_experts_per_rank, 0);
+                                                           num_experts_per_rank, 0, 0, false,
+                                                           sf_smem_outer_dim);
 
     // Stats can be optional
     int* cumulative_local_expert_recv_stats_ptr = nullptr;

@@ -53,7 +53,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     buffer = deep_gemm.get_symm_buffer_for_mega_moe(
         group, num_experts,
         num_max_tokens_per_rank, num_topk,
-        hidden, intermediate_hidden
+        hidden, intermediate_hidden,
+        act_format=args.act_format
     )
 
     # Create inputs
@@ -82,8 +83,11 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         assert intermediate_hidden % 128 == 0
         assert l1_weights.shape[2] % 128 == 0 and l2_weights.shape[2] % 128 == 0
 
-        # Cast inputs to FP8 with per-32 UE8M0 SF
-        x = per_token_cast_to_fp8(x, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
+        # Cast inputs to FP8 (E4M3) or MXFP4 (FP4 acts) with per-32 UE8M0 SF
+        if args.act_format == 'mxfp4':
+            x = per_token_cast_to_fp4(x, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
+        else:
+            x = per_token_cast_to_fp8(x, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
 
         # Cast grouped BF16 weights to FP4 with MN-major SF
         # TODO: merge with `cast_fp8_fp4_with_major`
@@ -275,6 +279,8 @@ if __name__ == '__main__':
     parser.add_argument('--num-topk', type=int, default=6, help='Number of expert selections')
     parser.add_argument('--masked-ratio', type=float, default=0.0, help='Mask some expert selections')
     parser.add_argument('--fast-math', type=int, default=1, help='Enable fast math (0 or 1, default: 1)')
+    parser.add_argument('--act-format', type=str, default='fp8', choices=['fp8', 'mxfp4'],
+                        help="Activation format: 'fp8' (E4M3) or 'mxfp4' (FP4 acts; mxf4-kind via DG_MEGA_MXF4_KIND, default on)")
 
     # Test settings
     parser.add_argument('--num-correctness-tests', type=int, default=None, help='Pressure test')
