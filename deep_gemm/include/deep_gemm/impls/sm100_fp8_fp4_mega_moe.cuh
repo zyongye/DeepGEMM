@@ -219,10 +219,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t SMEM_SEND_BUFFER_SIZE =
         math::constexpr_align(fp8_token_layout.get_num_bytes() * kNumDispatchWarps, kSharedMemoryAlignment);
     // A holds activations (`act_dtype_t`, 1 byte unpacked for FP8/FP4-mxf8f6f4); mxf4-kind packs 2 E2M1 per byte.
-    constexpr uint32_t SMEM_A_SIZE_PER_STAGE = kUseMxf4Kind ? (LOAD_BLOCK_M * BLOCK_K / 2)
-                                                            : (LOAD_BLOCK_M * BLOCK_K * sizeof(act_dtype_t));
-    constexpr uint32_t SMEM_B_SIZE_PER_STAGE = kUseMxf4Kind ? (LOAD_BLOCK_N * BLOCK_K / 2)
-                                                            : (LOAD_BLOCK_N * BLOCK_K * sizeof(b_dtype_t));
+    // `*_LOAD_BYTES` is the actual per-stage transfer footprint (used for TMA expect-tx); `*_SIZE_PER_STAGE`
+    // is the per-stage smem *stride*, which the flat layout requires to be 1024-byte aligned. They differ only
+    // for tiles smaller than 1024 B (e.g. mxf4-kind at block_m=16 -> 512 B): the slot is padded to 1024 and the
+    // tile data sits at the slot start, so the descriptor/MMA read the true tile while stages stay 1024-aligned.
+    constexpr uint32_t SMEM_A_LOAD_BYTES = kUseMxf4Kind ? (LOAD_BLOCK_M * BLOCK_K / 2)
+                                                        : (LOAD_BLOCK_M * BLOCK_K * sizeof(act_dtype_t));
+    constexpr uint32_t SMEM_B_LOAD_BYTES = kUseMxf4Kind ? (LOAD_BLOCK_N * BLOCK_K / 2)
+                                                        : (LOAD_BLOCK_N * BLOCK_K * sizeof(b_dtype_t));
+    constexpr uint32_t SMEM_A_SIZE_PER_STAGE = math::constexpr_align(SMEM_A_LOAD_BYTES, kSharedMemoryAlignment);
+    constexpr uint32_t SMEM_B_SIZE_PER_STAGE = math::constexpr_align(SMEM_B_LOAD_BYTES, kSharedMemoryAlignment);
     constexpr uint32_t SMEM_SFA_SIZE_PER_STAGE = SF_BLOCK_M * sizeof(uint32_t);
     constexpr uint32_t SMEM_SFB_SIZE_PER_STAGE = SF_BLOCK_N * sizeof(uint32_t);
     constexpr uint32_t SMEM_CD_L1_SIZE =
@@ -758,8 +764,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         // so the 2-CTA source transaction equals one smem footprint; dense mxf4 and FP8
                         // count two smem footprints per leader CTA.
                         constexpr uint32_t kExpectABytes =
-                            kUseMxf4Kind ? SMEM_A_SIZE_PER_STAGE * 2 :
-                            (kUseFp4Acts ? SMEM_A_SIZE_PER_STAGE : SMEM_A_SIZE_PER_STAGE * 2);
+                            kUseMxf4Kind ? SMEM_A_LOAD_BYTES * 2 :
+                            (kUseFp4Acts ? SMEM_A_LOAD_BYTES : SMEM_A_LOAD_BYTES * 2);
                         full_barriers[stage_idx]->arrive_and_expect_tx(
                             kExpectABytes + SMEM_SFA_SIZE_PER_STAGE * 2);
                     } else {
@@ -814,7 +820,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         tensor_map_sfb_ptr, full_barriers[stage_idx], smem_sfb[stage_idx], sfb_n_idx, sfb_k_idx, 2);
                     if (is_leader_cta) {
                         constexpr uint32_t kExpectBBytes =
-                            kUseMxf4Kind ? SMEM_B_SIZE_PER_STAGE * 2 : SMEM_B_SIZE_PER_STAGE;
+                            kUseMxf4Kind ? SMEM_B_LOAD_BYTES * 2 : SMEM_B_LOAD_BYTES;
                         full_barriers[stage_idx]->arrive_and_expect_tx(kExpectBBytes + BLOCK_N * sizeof(uint32_t) * 2);
                     } else {
                         full_barriers[stage_idx]->arrive(0u);
@@ -1420,6 +1426,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         constexpr uint32_t kNumHiddenBytes = kHidden * sizeof(nv_bfloat16);
         constexpr uint32_t kNumElemsPerUint4 = sizeof(uint4) / sizeof(nv_bfloat162);
 
+        // Smem available for combine reuse = everything before the barriers
+        // (regions: expert_count + send + CD + A + B + SFA + SFB + amax). This must match the
+        // runtime budget `barrier_start_ptr - smem_buffer`; `SMEM_BEFORE_BARRIER_SIZE` alone omits
+        // the per-stage SFA/SFB and the amax region, so using it here under-counts and can reject
+        // (at compile time) configs that actually fit at runtime.
+        constexpr uint32_t kNumReusableSmemBytes = SMEM_BEFORE_BARRIER_SIZE
+            + kNumStages * (SMEM_SFA_SIZE_PER_STAGE + SMEM_SFB_SIZE_PER_STAGE)
+            + STORE_BLOCK_M * kNumEpilogueWarps * 4;  // amax: (STORE_BLOCK_M/2) float2 per epilogue warp
+
         // 3 slots of chunk is needed: 2 load stages and 1 store
         constexpr uint32_t kNumChunkSlots = 3;
         constexpr uint32_t kNumMaxRegistersForBuffer = 128;
@@ -1427,7 +1442,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         // NOTES: either 1 or 2 chunks for simplicity
         // NOTES: Restrict on both smem and register
         constexpr uint32_t kNumChunks =
-            kNumChunkSlots * kNumEpilogueWarps * kNumHiddenBytes <= SMEM_BEFORE_BARRIER_SIZE and kHidden <= 32 * kNumMaxRegistersForBuffer ? 1 : 2;
+            kNumChunkSlots * kNumEpilogueWarps * kNumHiddenBytes <= kNumReusableSmemBytes and kHidden <= 32 * kNumMaxRegistersForBuffer ? 1 : 2;
         constexpr uint32_t kNumChunkBytes = kNumHiddenBytes / kNumChunks;
         constexpr uint32_t kNumChunkUint4 = kNumChunkBytes / sizeof(uint4);
         constexpr uint32_t kNumUint4PerLane = kNumChunkUint4 / 32;
@@ -1436,7 +1451,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         constexpr uint32_t kNumLoadBytesPerChunk = kUseFp8Combine ? (kNumChunkBytes / 2) : kNumChunkBytes;
         constexpr uint32_t kNumLoadElemsPerChunk = kHidden / kNumChunks;
         DG_STATIC_ASSERT(kHidden % kNumChunks == 0, "Hidden must be divisible by number of chunks");
-        DG_STATIC_ASSERT(kNumChunkSlots * kNumEpilogueWarps * kNumHiddenBytes / kNumChunks <= SMEM_BEFORE_BARRIER_SIZE, "Hidden is too large");
+        DG_STATIC_ASSERT(kNumChunkSlots * kNumEpilogueWarps * kNumHiddenBytes / kNumChunks <= kNumReusableSmemBytes, "Hidden is too large");
         DG_STATIC_ASSERT(kNumChunkBytes % 16 == 0, "Combine chunk must be TMA-aligned (16 bytes)");
         DG_STATIC_ASSERT(kNumChunkBytes % sizeof(uint4) == 0, "Combine chunk must be divisible by 16 bytes");
         DG_STATIC_ASSERT(kNumChunkUint4 % 32 == 0, "Combine chunk must be a multiple of 32 16-byte elements (one per lane)");

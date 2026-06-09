@@ -165,8 +165,12 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
 
     // Per-stage: A tile + B tile + SFA tile + SFB tile + full/empty barriers.
     // mxf4-kind packs 2 E2M1 per byte (A and B halved); FP8 / FP4-mxf8f6f4 use 1 byte/elem in smem.
-    const int smem_a_per_stage = use_mxf4_kind ? (load_block_m * block_k / 2) : (load_block_m * block_k);
-    const int smem_b_per_stage = use_mxf4_kind ? (block_n * block_k / 2) : (block_n * block_k);
+    // Per-stage A/B smem strides are 1024-byte aligned to match the kernel's flat layout
+    // (`SMEM_A/B_SIZE_PER_STAGE = align(load_bytes, 1024)`); a sub-1024 tile (e.g. mxf4-kind at
+    // block_m=16 -> 512 B) pads its slot. Must stay in lockstep with the device side or num_stages
+    // under-counts and the layout overruns the barriers (illegal memory access).
+    const int smem_a_per_stage = align(use_mxf4_kind ? (load_block_m * block_k / 2) : (load_block_m * block_k), kSmemAlignment);
+    const int smem_b_per_stage = align(use_mxf4_kind ? (block_n * block_k / 2) : (block_n * block_k), kSmemAlignment);
     const int smem_per_stage = smem_a_per_stage + smem_b_per_stage + smem_sfa_per_stage + smem_sfb_per_stage + 2 * 8;
 
     // Fixed total
