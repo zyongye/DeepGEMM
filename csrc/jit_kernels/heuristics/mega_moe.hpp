@@ -127,7 +127,8 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     const int& num_experts, const int& hidden,
     const int& block_m, const int& block_n, const int& block_k, const int& store_block_m,
     const int& sf_block_m, const int& sf_block_n,
-    const int& num_dispatch_warps, const int& num_epilogue_warps) {
+    const int& num_dispatch_warps, const int& num_epilogue_warps,
+    const bool& use_fp4_acts = false, const bool& use_mxf4_kind = false) {
     constexpr int kSmemAlignment = 1024;
     constexpr int kNumEpilogueStages = 2;
     constexpr int kNumTMAStoreStages = 2;
@@ -139,7 +140,7 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     const int smem_expert_count_size = align(
         num_experts * static_cast<int>(sizeof(uint32_t)), kSmemAlignment);
     const int smem_send_buffers_size = align(
-        static_cast<int>(layout::Buffer(layout::Data(hidden), num_dispatch_warps, 1).get_num_bytes()),
+        static_cast<int>(layout::Buffer(layout::Data(use_fp4_acts ? hidden / 2 : hidden), num_dispatch_warps, 1).get_num_bytes()),
         kSmemAlignment);
     const int smem_dispatch_size = smem_expert_count_size + smem_send_buffers_size;
 
@@ -162,8 +163,11 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     const int smem_sfa_per_stage = sf_block_m * 4;
     const int smem_sfb_per_stage = sf_block_n * 4;
 
-    // Per-stage: A tile + B tile + SFA tile + SFB tile + full/empty barriers
-    const int smem_per_stage = load_block_m * block_k + block_n * block_k + smem_sfa_per_stage + smem_sfb_per_stage + 2 * 8;
+    // Per-stage: A tile + B tile + SFA tile + SFB tile + full/empty barriers.
+    // mxf4-kind packs 2 E2M1 per byte (A and B halved); FP8 / FP4-mxf8f6f4 use 1 byte/elem in smem.
+    const int smem_a_per_stage = use_mxf4_kind ? (load_block_m * block_k / 2) : (load_block_m * block_k);
+    const int smem_b_per_stage = use_mxf4_kind ? (block_n * block_k / 2) : (block_n * block_k);
+    const int smem_per_stage = smem_a_per_stage + smem_b_per_stage + smem_sfa_per_stage + smem_sfb_per_stage + 2 * 8;
 
     // Fixed total
     const int smem_fixed = smem_dispatch_size + smem_cd + smem_amax_reduction + smem_barriers + smem_tmem_ptr;
@@ -179,7 +183,10 @@ static MegaMoEConfig get_mega_moe_config(
     const int& num_ranks, const int& num_experts, const int& num_experts_per_rank,
     const int& num_max_tokens_per_rank, const int& num_tokens, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
-    const int& num_padded_sf_pool_tokens) {
+    const int& num_padded_sf_pool_tokens,
+    const bool& use_fp4_acts = false,
+    const bool& use_mxf4_kind = false) {
+
     // Block config
     const auto [cluster_size, block_m, store_block_m, num_epilogue_threads] =
         get_block_config_for_mega_moe(num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens);
@@ -210,7 +217,8 @@ static MegaMoEConfig get_mega_moe_config(
         num_experts, hidden,
         block_m, block_n, block_k, store_block_m,
         sf_block_m, sf_block_n,
-        num_dispatch_threads / 32, num_epilogue_threads / 32);
+        num_dispatch_threads / 32, num_epilogue_threads / 32,
+        use_fp4_acts, use_mxf4_kind);
 
     const auto config = MegaMoEConfig {
         block_m, block_n, block_k,

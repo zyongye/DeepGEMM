@@ -20,7 +20,9 @@ class SymmBuffer:
                  num_max_tokens_per_rank: int, num_topk: int,
                  hidden: int, intermediate_hidden: int,
                  use_fp8_dispatch: bool = True,
-                 activation: str = 'swiglu'):
+                 activation: str = 'swiglu',
+                 combine_dtype: torch.dtype = torch.bfloat16,
+                 act_format: str = 'fp8'):
         self.group = group
         self.num_experts = num_experts
         self.num_max_tokens_per_rank = num_max_tokens_per_rank
@@ -28,12 +30,19 @@ class SymmBuffer:
         self.hidden = hidden
         self.intermediate_hidden = intermediate_hidden
 
+        # Combine transport dtype: bf16 (default) or fp8-e4m3 (halves combine NVLink bytes)
+        assert combine_dtype in (torch.bfloat16, torch.float8_e4m3fn)
+        assert act_format in ('fp8', 'mxfp4')
+        self.combine_dtype = combine_dtype
+        self.act_format = act_format
+        use_fp8_combine = combine_dtype == torch.float8_e4m3fn
+
         # Allocate a symmetric buffer
         num_bytes, slice_input_buffers = _C.get_symm_buffer_size_for_mega_moe(
             group.size(), num_experts,
             num_max_tokens_per_rank, num_topk,
             hidden, intermediate_hidden,
-            use_fp8_dispatch, activation
+            use_fp8_dispatch, activation, use_fp8_combine, act_format
         )
         self.buffer = symm_mem.empty(num_bytes, dtype=torch.int8, device='cuda')
         self.handle = symm_mem.rendezvous(self.buffer, group=group)
@@ -60,7 +69,9 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
                                  num_max_tokens_per_rank: int, num_topk: int,
                                  hidden: int, intermediate_hidden: int,
                                  use_fp8_dispatch: bool = True,
-                                 activation: str = 'swiglu') -> SymmBuffer:
+                                 activation: str = 'swiglu',
+                                 combine_dtype: torch.dtype = torch.bfloat16,
+                                 act_format: str = 'fp8') -> SymmBuffer:
     # Token count must be aligned to block sizes
     num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe())
 
@@ -68,7 +79,7 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
         group, num_experts,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
-        use_fp8_dispatch, activation
+        use_fp8_dispatch, activation, combine_dtype, act_format
     )
 
 
@@ -114,6 +125,7 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      activation: str = 'swiglu',
                      activation_clamp: Optional[float] = None,
                      fast_math: bool = True):
+    use_fp8_combine = sym_buffer.combine_dtype == torch.float8_e4m3fn
     _C.fp8_fp4_mega_moe(
         y,
         l1_weights, l2_weights,
@@ -124,5 +136,5 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         sym_buffer.num_experts, sym_buffer.num_topk,
         recipe,
         activation, activation_clamp,
-        fast_math
+        fast_math, use_fp8_combine, sym_buffer.act_format
     )

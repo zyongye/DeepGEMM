@@ -34,6 +34,9 @@ template <
     uint32_t kNumSMs, uint32_t kNumRanks,
     float kActivationClamp,
     bool kFastMath,
+    bool kUseFp8Combine = false,
+    bool kUseFp4Acts = false,
+    bool kUseMxf4Kind = false,
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
     uint32_t L2_SHAPE_N = kHidden,
@@ -69,6 +72,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(kNumNonEpilogueThreads == 128, "Invalid number of MMA non-epilogue threads");
     DG_STATIC_ASSERT(kNumEpilogueThreads % 128 == 0, "Invalid number of MMA epilogue and combine threads");
     DG_STATIC_ASSERT(kNumExperts % kNumRanks == 0, "Invalid number of experts or ranks");
+    DG_STATIC_ASSERT(not kUseMxf4Kind or kUseFp4Acts, "kind::mxf4 requires FP4 activations");
 
     // Thread indices
     const bool is_leader_cta = cute::block_rank_in_cluster() == 0;
@@ -94,10 +98,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     const auto workspace = layout::Workspace(
         sym_buffer.get_base_ptr(), kNumRanks, kNumExperts, kNumMaxTokensPerRank, kNumTopk);
 
-    // Token and buffer layouts
-    constexpr auto fp8_token_layout = layout::Data(kHidden);
+    // Token and buffer layouts. Activations are FP8 E4M3 (1 byte/elem) or packed MXFP4 E2M1 (hidden/2 bytes)
+    constexpr uint32_t kInputTokenBytes = kUseFp4Acts ? (kHidden / 2) : kHidden;
+    constexpr uint32_t kIntermediateTokenBytes = kUseFp4Acts ? (kIntermediateHidden / 2) : kIntermediateHidden;
+    constexpr auto fp8_token_layout = layout::Data(kInputTokenBytes);
     constexpr auto bf16_token_layout = layout::Data(kHidden * sizeof(nv_bfloat16));
-    constexpr auto fp8_intermediate_token_layout = layout::Data(kIntermediateHidden);
+    constexpr auto fp8_intermediate_token_layout = layout::Data(kIntermediateTokenBytes);
     constexpr auto fp8_sf_layout = layout::Data(kHidden / 32);
     constexpr auto fp8_intermediate_sf_layout = layout::Data(kIntermediateHidden / 32);
     constexpr auto input_topk_idx_layout = layout::Data(kNumTopk * sizeof(int64_t), false);
@@ -152,23 +158,36 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         l2_token_buffer.get_end_ptr()
     );
 
-    // Combine inputs
+    // Combine inputs: BF16 (default) or FP8 E4M3 + per-128 UE8M0 SF
+    constexpr uint32_t kCombineGranK = 128;
+    DG_STATIC_ASSERT(kHidden % kCombineGranK == 0, "kHidden must be divisible by 128 for FP8 combine SF");
+    constexpr auto combine_token_layout = kUseFp8Combine ? layout::Data(kHidden) : bf16_token_layout;
+    constexpr auto combine_sf_layout = layout::Data(kUseFp8Combine ? kHidden / kCombineGranK : 0, false);
     const auto combine_token_buffer = layout::Buffer(
-        bf16_token_layout, kNumTopk, kNumMaxTokensPerRank,
+        combine_token_layout, kNumTopk, kNumMaxTokensPerRank,
         l2_sf_buffer.get_end_ptr()
+    );
+    const auto combine_sf_buffer = layout::Buffer(
+        combine_sf_layout, kNumTopk, kNumMaxTokensPerRank,
+        combine_token_buffer.get_end_ptr()
     );
 
     // Data types
-    // NOTES: activations are FP8 (e4m3), weights are FP4 (e2m1)
+    // NOTES: weights are FP4 (e2m1); activations are FP8 (e4m3) or, when kUseFp4Acts, FP4 (e2m1)
     using a_dtype_t = cutlass::float_e4m3_t;
     using b_dtype_t = cutlass::detail::float_e2m1_unpacksmem_t;
+    // Activation operand dtype (L1 reads x, L2 reads the L1 output). Both stay 1 byte in smem:
+    // FP4 uses the e2m1 "unpacksmem" layout (_ALIGN16B, 1 byte/elem with padding) for the mxf8f6f4 path.
+    using act_dtype_t = cute::conditional_t<kUseFp4Acts, b_dtype_t, a_dtype_t>;
+    DG_STATIC_ASSERT(sizeof(act_dtype_t) == sizeof(a_dtype_t), "Activation operand must stay 1 byte in smem");
 
     // MMA configs
     // NOTES: always swap A/B, 2-CTA MMA, and matrices are K-major
     constexpr uint32_t LAYOUT_AD_M = 128;
     constexpr uint32_t UMMA_M = LAYOUT_AD_M * 2;
     constexpr uint32_t UMMA_N = BLOCK_M;  // Swap AB
-    constexpr uint32_t UMMA_K = 32;
+    constexpr uint32_t UMMA_BLOCK_K = 128;
+    constexpr uint32_t UMMA_K = kUseMxf4Kind ? 64 : 32;
     constexpr uint32_t LOAD_BLOCK_M = BLOCK_M / 2;  // Multicast on A
     constexpr uint32_t LOAD_BLOCK_N = BLOCK_N;
     DG_STATIC_ASSERT(BLOCK_M % 16 == 0, "Invalid block M");
@@ -176,8 +195,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(BLOCK_K == 128, "Invalid block K");
 
     // Swizzle configs
-    constexpr uint32_t kSwizzleAMode = BLOCK_K * sizeof(a_dtype_t);
-    constexpr uint32_t kSwizzleBMode = BLOCK_K * sizeof(b_dtype_t);
+    constexpr uint32_t kSwizzleAMode = kUseMxf4Kind ? (BLOCK_K / 2) : (BLOCK_K * sizeof(act_dtype_t));
+    constexpr uint32_t kSwizzleBMode = kUseMxf4Kind ? (BLOCK_K / 2) : (BLOCK_K * sizeof(b_dtype_t));
     constexpr uint32_t kSwizzleCDMode = 128;
     DG_STATIC_ASSERT(BLOCK_N % kSwizzleCDMode == 0, "Invalid block N");
 
@@ -192,12 +211,18 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // Shared memory sizes
     // NOTES: FP8 CD output for L1 (2 TMA stages, BLOCK_N/2 post-SwiGLU), BF16 output for L2 (no TMA, a single stage)
     constexpr uint32_t L1_OUT_BLOCK_N = BLOCK_N / 2;
+    // FP4 packs 2 E2M1 per byte, so the L1-output row footprint halves
+    constexpr uint32_t L1_OUT_ROW_BYTES = kUseFp4Acts ? (L1_OUT_BLOCK_N / 2) : L1_OUT_BLOCK_N;
+
     constexpr uint32_t SMEM_EXPERT_COUNT_SIZE =
         math::constexpr_align<uint32_t>(kNumExperts * sizeof(uint32_t), kSharedMemoryAlignment);
     constexpr uint32_t SMEM_SEND_BUFFER_SIZE =
         math::constexpr_align(fp8_token_layout.get_num_bytes() * kNumDispatchWarps, kSharedMemoryAlignment);
-    constexpr uint32_t SMEM_A_SIZE_PER_STAGE = LOAD_BLOCK_M * BLOCK_K * sizeof(a_dtype_t);
-    constexpr uint32_t SMEM_B_SIZE_PER_STAGE = LOAD_BLOCK_N * BLOCK_K * sizeof(b_dtype_t);
+    // A holds activations (`act_dtype_t`, 1 byte unpacked for FP8/FP4-mxf8f6f4); mxf4-kind packs 2 E2M1 per byte.
+    constexpr uint32_t SMEM_A_SIZE_PER_STAGE = kUseMxf4Kind ? (LOAD_BLOCK_M * BLOCK_K / 2)
+                                                            : (LOAD_BLOCK_M * BLOCK_K * sizeof(act_dtype_t));
+    constexpr uint32_t SMEM_B_SIZE_PER_STAGE = kUseMxf4Kind ? (LOAD_BLOCK_N * BLOCK_K / 2)
+                                                            : (LOAD_BLOCK_N * BLOCK_K * sizeof(b_dtype_t));
     constexpr uint32_t SMEM_SFA_SIZE_PER_STAGE = SF_BLOCK_M * sizeof(uint32_t);
     constexpr uint32_t SMEM_SFB_SIZE_PER_STAGE = SF_BLOCK_N * sizeof(uint32_t);
     constexpr uint32_t SMEM_CD_L1_SIZE =
@@ -240,7 +265,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     });
     auto smem_cd_l2 = smem_cd[0];
     auto smem_a = utils::PatternVisitor([=](const uint32_t& i) {
-        return math::advance_ptr<a_dtype_t>(smem_gemm_base, SMEM_CD_SIZE + i * SMEM_A_SIZE_PER_STAGE);
+        return math::advance_ptr<act_dtype_t>(smem_gemm_base, SMEM_CD_SIZE + i * SMEM_A_SIZE_PER_STAGE);
     });
     auto smem_b = utils::PatternVisitor([=](const uint32_t& i) {
         return math::advance_ptr<b_dtype_t>(smem_gemm_base, SMEM_CD_SIZE + kNumStages * SMEM_A_SIZE_PER_STAGE + i * SMEM_B_SIZE_PER_STAGE);
@@ -545,12 +570,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const uint32_t src_topk_idx = src_token_topk_idx % kNumTopk;
 
             // TMA load token from remote rank into shared memory
+            // NOTES: token footprint is `kInputTokenBytes` (= kHidden for FP8, kHidden/2 for packed FP4)
             if (cute::elect_one_sync()) {
                 ptx::tma_load_1d(
                     pull_buffer.get_base_ptr(),
                     sym_buffer.map(input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(),
                                    current_rank_in_expert_idx),
-                    pull_mbarrier, kHidden);
+                    pull_mbarrier, kInputTokenBytes);
             }
             __syncwarp();
 
@@ -581,7 +607,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 *l1_topk_weights_buffer.get_data_buffer(pool_token_idx).get_base_ptr<float>() = weight;
 
                 // Wait for TMA token load to complete
-                ptx::mbarrier_arrive_and_set_tx(pull_mbarrier, kHidden);
+                ptx::mbarrier_arrive_and_set_tx(pull_mbarrier, kInputTokenBytes);
                 ptx::mbarrier_wait_and_flip_phase(pull_mbarrier, pull_mbarrier_phase);
 
                 // Store token to local L1 buffer via TMA
@@ -714,12 +740,28 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
                 // TMA copy tokens and SFA, then arrive at full barrier
                 if (cute::elect_one_sync()) {
-                    tma::copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t>(
-                        tensor_map_a_ptr, full_barriers[stage_idx], smem_a[stage_idx], k_idx, m_idx, 2);
+                    if constexpr (kUseMxf4Kind) {
+                        cute::SM100_TMA_2SM_LOAD_2D::copy(
+                            tensor_map_a_ptr,
+                            reinterpret_cast<uint64_t*>(full_barriers[stage_idx]),
+                            static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL),
+                            reinterpret_cast<uint8_t*>(smem_a[stage_idx]),
+                            k_idx, m_idx);
+                    } else {
+                        tma::copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, act_dtype_t>(
+                            tensor_map_a_ptr, full_barriers[stage_idx], smem_a[stage_idx], k_idx, m_idx, 2);
+                    }
                     tma::copy<SF_BLOCK_M, 1, 0>(
                         tensor_map_sfa_ptr, full_barriers[stage_idx], smem_sfa[stage_idx], sfa_m_idx, sfa_k_idx, 2);
                     if (is_leader_cta) {
-                        full_barriers[stage_idx]->arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE * 2 + SF_BLOCK_M * sizeof(uint32_t) * 2);
+                        // FP4 unpacksmem expands packed source bytes into a 1-byte/elem smem footprint,
+                        // so the 2-CTA source transaction equals one smem footprint; dense mxf4 and FP8
+                        // count two smem footprints per leader CTA.
+                        constexpr uint32_t kExpectABytes =
+                            kUseMxf4Kind ? SMEM_A_SIZE_PER_STAGE * 2 :
+                            (kUseFp4Acts ? SMEM_A_SIZE_PER_STAGE : SMEM_A_SIZE_PER_STAGE * 2);
+                        full_barriers[stage_idx]->arrive_and_expect_tx(
+                            kExpectABytes + SMEM_SFA_SIZE_PER_STAGE * 2);
                     } else {
                         full_barriers[stage_idx]->arrive(0u);
                     }
@@ -757,12 +799,23 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
                 // TMA copy weights with SF
                 if (cute::elect_one_sync()) {
-                    tma::copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t>(
-                        tensor_map_b_ptr, full_barriers[stage_idx], smem_b[stage_idx], k_idx, n_idx, 2);
+                    if constexpr (kUseMxf4Kind) {
+                        cute::SM100_TMA_2SM_LOAD_2D::copy(
+                            tensor_map_b_ptr,
+                            reinterpret_cast<uint64_t*>(full_barriers[stage_idx]),
+                            static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL),
+                            reinterpret_cast<uint8_t*>(smem_b[stage_idx]),
+                            k_idx, n_idx);
+                    } else {
+                        tma::copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t>(
+                            tensor_map_b_ptr, full_barriers[stage_idx], smem_b[stage_idx], k_idx, n_idx, 2);
+                    }
                     tma::copy<BLOCK_N, 1, 0>(
                         tensor_map_sfb_ptr, full_barriers[stage_idx], smem_sfb[stage_idx], sfb_n_idx, sfb_k_idx, 2);
                     if (is_leader_cta) {
-                        full_barriers[stage_idx]->arrive_and_expect_tx(SMEM_B_SIZE_PER_STAGE + BLOCK_N * sizeof(uint32_t) * 2);
+                        constexpr uint32_t kExpectBBytes =
+                            kUseMxf4Kind ? SMEM_B_SIZE_PER_STAGE * 2 : SMEM_B_SIZE_PER_STAGE;
+                        full_barriers[stage_idx]->arrive_and_expect_tx(kExpectBBytes + BLOCK_N * sizeof(uint32_t) * 2);
                     } else {
                         full_barriers[stage_idx]->arrive(0u);
                     }
@@ -778,16 +831,33 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         if (is_leader_cta) {
             // Make instruction descriptor with block scaling
             // NOTES: always swap A/B
+            using mxf4_dtype_t = cute::float_e2m1_t;
+            using idesc_a_dtype_t = cute::conditional_t<kUseMxf4Kind, mxf4_dtype_t, b_dtype_t>;
+            using idesc_b_dtype_t = cute::conditional_t<kUseMxf4Kind, mxf4_dtype_t, act_dtype_t>;
             auto instr_desc = cute::UMMA::make_instr_desc_block_scaled<
-                b_dtype_t, a_dtype_t, float, cutlass::float_ue8m0_t,
+                idesc_a_dtype_t, idesc_b_dtype_t, float, cutlass::float_ue8m0_t,
                 UMMA_M, UMMA_N,
                 cute::UMMA::Major::K, cute::UMMA::Major::K
             >();
             auto sf_desc = mma::sm100::make_sf_desc(nullptr);
 
             DG_STATIC_ASSERT(kNumStages <= 32, "Too many stages");
-            auto a_desc = mma::sm100::make_umma_desc<cute::UMMA::Major::K, LOAD_BLOCK_M, BLOCK_K, kSwizzleAMode>(smem_a[0], 0, 0);
-            auto b_desc = mma::sm100::make_umma_desc<cute::UMMA::Major::K, LOAD_BLOCK_N, BLOCK_K, kSwizzleBMode>(smem_b[0], 0, 0);
+            cute::UMMA::SmemDescriptor a_desc, b_desc;
+            if constexpr (kUseMxf4Kind) {
+                a_desc = mma::sm100::make_umma_desc<
+                    cute::UMMA::Major::K, LOAD_BLOCK_M, BLOCK_K / 2, kSwizzleAMode, false, uint8_t>(
+                        reinterpret_cast<uint8_t*>(smem_a[0]), 0, 0);
+                b_desc = mma::sm100::make_umma_desc<
+                    cute::UMMA::Major::K, LOAD_BLOCK_N, BLOCK_K / 2, kSwizzleBMode, false, uint8_t>(
+                        reinterpret_cast<uint8_t*>(smem_b[0]), 0, 0);
+            } else {
+                a_desc = mma::sm100::make_umma_desc<
+                    cute::UMMA::Major::K, LOAD_BLOCK_M, UMMA_BLOCK_K, kSwizzleAMode>(
+                        smem_a[0], 0, 0);
+                b_desc = mma::sm100::make_umma_desc<
+                    cute::UMMA::Major::K, LOAD_BLOCK_N, UMMA_BLOCK_K, kSwizzleBMode>(
+                        smem_b[0], 0, 0);
+            }
             uint32_t a_desc_lo = lane_idx < kNumStages ? a_desc.lo + lane_idx * SMEM_A_SIZE_PER_STAGE / 16 : 0u;
             uint32_t b_desc_lo = lane_idx < kNumStages ? b_desc.lo + lane_idx * SMEM_B_SIZE_PER_STAGE / 16 : 0u;
 
@@ -854,16 +924,35 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         // Issue UMMA
                         #pragma unroll
                         for (uint32_t k = 0; k < BLOCK_K / UMMA_K; ++ k) {
-                            const auto runtime_instr_desc =
-                                mma::sm100::make_runtime_instr_desc_with_sf_id(instr_desc, k, k);
-                            a_desc.lo = mma::sm100::advance_umma_desc_lo<
-                                cute::UMMA::Major::K, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t>(a_desc_base_lo, 0, k * UMMA_K);
-                            b_desc.lo = mma::sm100::advance_umma_desc_lo<
-                                cute::UMMA::Major::K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t>(b_desc_base_lo, 0, k * UMMA_K);
-                            ptx::SM100_MMA_MXF8F6F4_2x1SM_SS::fma(
-                                b_desc, a_desc, accum_stage_idx * UMMA_N,
-                                k_block_idx > 0 or k > 0, runtime_instr_desc,
-                                kTmemStartColOfSFB, kTmemStartColOfSFA);
+                            if constexpr (kUseMxf4Kind) {
+                                const auto runtime_instr_desc =
+                                    mma::sm100::make_runtime_instr_desc_with_sf_id(instr_desc, k * 2, k * 2);
+                                constexpr uint32_t kDenseBytesPerUMMAK = UMMA_K / 2;
+                                const uint32_t dense_k_byte_idx = k * kDenseBytesPerUMMAK;
+                                a_desc.lo = mma::sm100::advance_umma_desc_lo<
+                                    cute::UMMA::Major::K, LOAD_BLOCK_M, kSwizzleAMode, uint8_t>(
+                                        a_desc_base_lo, 0, dense_k_byte_idx);
+                                b_desc.lo = mma::sm100::advance_umma_desc_lo<
+                                    cute::UMMA::Major::K, LOAD_BLOCK_N, kSwizzleBMode, uint8_t>(
+                                        b_desc_base_lo, 0, dense_k_byte_idx);
+                                ptx::SM100_MMA_MXF4_2x1SM_SS::fma(
+                                    b_desc, a_desc, accum_stage_idx * UMMA_N,
+                                    k_block_idx > 0 or k > 0, runtime_instr_desc,
+                                    kTmemStartColOfSFB, kTmemStartColOfSFA);
+                            } else {
+                                const auto runtime_instr_desc =
+                                    mma::sm100::make_runtime_instr_desc_with_sf_id(instr_desc, k, k);
+                                a_desc.lo = mma::sm100::advance_umma_desc_lo<
+                                    cute::UMMA::Major::K, LOAD_BLOCK_M, kSwizzleAMode, act_dtype_t>(
+                                        a_desc_base_lo, 0, k * UMMA_K);
+                                b_desc.lo = mma::sm100::advance_umma_desc_lo<
+                                    cute::UMMA::Major::K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t>(
+                                        b_desc_base_lo, 0, k * UMMA_K);
+                                ptx::SM100_MMA_MXF8F6F4_2x1SM_SS::fma(
+                                    b_desc, a_desc, accum_stage_idx * UMMA_N,
+                                    k_block_idx > 0 or k > 0, runtime_instr_desc,
+                                    kTmemStartColOfSFB, kTmemStartColOfSFA);
+                            }
                         }
                     }
                     __syncwarp();
@@ -1047,23 +1136,62 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         amax_values[i].x = cute::max(amax_values[i].x, wp_amax.x);
                         amax_values[i].y = cute::max(amax_values[i].y, wp_amax.y);
 
-                        // Calculate SF
+                        // Calculate SF (E2M1 uses finfo.max=6; E4M3 uses 448)
                         float2 sf, sf_inv;
-                        math::get_e4m3_sf_and_sf_inv(amax_values[i], sf, sf_inv);
+                        if constexpr (kUseFp4Acts)
+                            math::get_e2m1_sf_and_sf_inv(amax_values[i], sf, sf_inv);
+                        else
+                            math::get_e4m3_sf_and_sf_inv(amax_values[i], sf, sf_inv);
 
                         // Cast
                         const float2 upper = __fmul2_rn(swiglu_values[i * 2 + 0], sf_inv);
                         const float2 lower = __fmul2_rn(swiglu_values[i * 2 + 1], sf_inv);
-                        const auto fp8x4_values = __nv_fp8x4_e4m3(make_float4(upper.x, upper.y, lower.x, lower.y));
 
-                        // STSM
-                        uint32_t row = lane_idx;
-                        uint32_t col = warp_idx_in_wg;
-                        const auto smem_ptr = smem_cd[tma_stage_idx] + epilogue_wg_idx * STORE_BLOCK_M * L1_OUT_BLOCK_N
-                                                                     + i * ATOM_M * L1_OUT_BLOCK_N
-                                                                     + row * L1_OUT_BLOCK_N
-                                                                     + (col ^ (row / 2)) * kNumBankGroupBytes;
-                        ptx::SM100_U8x4_STSM_T<__nv_fp8x4_e4m3>::copy(fp8x4_values, smem_ptr);
+                        if constexpr (kUseFp4Acts) {
+                            // Pack SwiGLU output to E2M1 in canonical dense smem (TMA descriptor swizzle=0).
+                            // Under SwapAB, tcgen05.ld places adjacent N-cols on lanes T and T^4, so packing two
+                            // values into one FP4 byte needs the buddy from lane^4; the active half-warp
+                            // (group = lane/4, group%2==0) writes 4 bytes, the other half is the donor.
+                            const float buddy_ux = __shfl_xor_sync(0xffffffffu, upper.x, 4);
+                            const float buddy_uy = __shfl_xor_sync(0xffffffffu, upper.y, 4);
+                            const float buddy_lx = __shfl_xor_sync(0xffffffffu, lower.x, 4);
+                            const float buddy_ly = __shfl_xor_sync(0xffffffffu, lower.y, 4);
+                            const uint32_t frag = lane_idx % 4;     // row-pair index 0..3
+                            const uint32_t group = lane_idx / 4;    // col-group index 0..7
+                            if ((group % 2u) == 0u) {
+                                // cvt_pack_f32_to_e2m1x2(a, b) -> byte {low nibble = a (own), high nibble = b (buddy)}
+                                const uint8_t byte_ux = static_cast<uint8_t>(math::cvt_pack_f32_to_e2m1x2(upper.x, buddy_ux));
+                                const uint8_t byte_uy = static_cast<uint8_t>(math::cvt_pack_f32_to_e2m1x2(upper.y, buddy_uy));
+                                const uint8_t byte_lx = static_cast<uint8_t>(math::cvt_pack_f32_to_e2m1x2(lower.x, buddy_lx));
+                                const uint8_t byte_ly = static_cast<uint8_t>(math::cvt_pack_f32_to_e2m1x2(lower.y, buddy_ly));
+                                constexpr uint32_t kFp4WarpStripeBytes = 8;  // 16 elements / 2
+                                const uint32_t byte_pos_upper = group / 2u;          // 0..3
+                                const uint32_t byte_pos_lower = 4u + group / 2u;     // 4..7
+                                const uint32_t row_even = i * ATOM_M + 2u * frag;
+                                const uint32_t row_odd = row_even + 1u;
+                                const auto base = smem_cd[tma_stage_idx] + epilogue_wg_idx * STORE_BLOCK_M * L1_OUT_BLOCK_N
+                                    + warp_idx_in_wg * kFp4WarpStripeBytes;
+                                auto write_byte = [&](const uint32_t& row, const uint32_t& bp, const uint8_t& v) {
+                                    const auto p = base + row * L1_OUT_ROW_BYTES + bp;
+                                    asm volatile("st.shared.u8 [%0], %1;\n" :: "l"(__cvta_generic_to_shared(p)), "r"(static_cast<uint32_t>(v)));
+                                };
+                                write_byte(row_even, byte_pos_upper, byte_ux);
+                                write_byte(row_odd, byte_pos_upper, byte_uy);
+                                write_byte(row_even, byte_pos_lower, byte_lx);
+                                write_byte(row_odd, byte_pos_lower, byte_ly);
+                            }
+                        } else {
+                            const auto fp8x4_values = __nv_fp8x4_e4m3(make_float4(upper.x, upper.y, lower.x, lower.y));
+                            // STSM
+                            uint32_t row = lane_idx;
+                            uint32_t col = warp_idx_in_wg;
+                            const auto smem_ptr = smem_cd[tma_stage_idx] + epilogue_wg_idx * STORE_BLOCK_M * L1_OUT_BLOCK_N
+                                + i * ATOM_M * L1_OUT_BLOCK_N
+                                + row * L1_OUT_BLOCK_N
+                                // Use 64B swizzle for SwiGLU, so divided by 2
+                                + (col ^ (row / 2)) * kNumBankGroupBytes;
+                            ptx::SM100_U8x4_STSM_T<__nv_fp8x4_e4m3>::copy(fp8x4_values, smem_ptr);
+                        }
 
                         // Store SF to `l2_sf_buffer` as UE8M0 (MN-major layout)
                         // Only one warp per pair writes (both hold the same SF after cross-warp reduce)
@@ -1097,7 +1225,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
                     // Issue TMA store after all atoms in this store block
                     if (warp_idx_in_wg == 0 and cute::elect_one_sync()) {
-                        uint32_t out_n_idx = n_block_idx * L1_OUT_BLOCK_N;
+                        const uint32_t out_n_idx = kUseFp4Acts
+                            ? (kUseMxf4Kind
+                                ? (n_block_idx * L1_OUT_BLOCK_N)       // dense FP4 descriptor: FP4-element offset
+                                : (n_block_idx * (L1_OUT_BLOCK_N / 2))) // byte descriptor fallback
+                            : (n_block_idx * L1_OUT_BLOCK_N);
                         cute::tma_store_fence();
                         cute::SM90_TMA_STORE_2D::copy(
                             &tensor_map_l1_output,
@@ -1209,13 +1341,56 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             (bank_group_idx ^ row_in_atom) * kNumBankGroupBytes;
                         const auto packed = ptx::ld_shared(reinterpret_cast<float4*>(smem_ptr));
 
-                        // Write into remote
-                        const auto dst_token = combine_token_buffer.get_rank_buffer(dst_topk_idx)
-                                               .get_data_buffer(dst_token_idx);
-                        const auto dst_ptr = math::advance_ptr<float4>(
-                            dst_token.get_base_ptr(),
-                            n_idx * static_cast<uint32_t>(sizeof(nv_bfloat16)) + (lane_idx % 16) * static_cast<uint32_t>(sizeof(float4)));
-                        *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
+                        // Write into the remote combine buffer
+                        if constexpr (kUseFp8Combine) {
+                            // Quantize this row's BLOCK_N=128 elements to E4M3 with one UE8M0 SF.
+                            // The 16 lanes with the same `lane_idx / 16` own one row; reduce amax across them.
+                            const auto bf = reinterpret_cast<const nv_bfloat162*>(&packed);
+                            float amax = 0.0f;
+                            #pragma unroll
+                            for (uint32_t q = 0; q < 4; ++ q) {
+                                const float2 v = __bfloat1622float2(bf[q]);
+                                amax = cute::max(amax, cute::max(cute::abs(v.x), cute::abs(v.y)));
+                            }
+                            const uint32_t row_mask = 0x0000ffffu << (16u * (lane_idx / 16u));
+                            amax = cute::max(amax, __shfl_xor_sync(row_mask, amax, 1));
+                            amax = cute::max(amax, __shfl_xor_sync(row_mask, amax, 2));
+                            amax = cute::max(amax, __shfl_xor_sync(row_mask, amax, 4));
+                            amax = cute::max(amax, __shfl_xor_sync(row_mask, amax, 8));
+
+                            const int sf_log2 = math::fast_log2_ceil(amax * (1.0f / 448.0f));
+                            const float sf_inv = math::fast_pow2(-sf_log2);
+                            const uint8_t sf_byte = static_cast<uint8_t>(sf_log2 + 127);
+
+                            const float2 v0 = __bfloat1622float2(bf[0]), v1 = __bfloat1622float2(bf[1]);
+                            const float2 v2 = __bfloat1622float2(bf[2]), v3 = __bfloat1622float2(bf[3]);
+                            const __nv_fp8x4_e4m3 lo(make_float4(v0.x * sf_inv, v0.y * sf_inv, v1.x * sf_inv, v1.y * sf_inv));
+                            const __nv_fp8x4_e4m3 hi(make_float4(v2.x * sf_inv, v2.y * sf_inv, v3.x * sf_inv, v3.y * sf_inv));
+                            const uint64_t fp8_packed = static_cast<uint64_t>(lo.__x) | (static_cast<uint64_t>(hi.__x) << 32);
+
+                            const auto dst_token = combine_token_buffer.get_rank_buffer(dst_topk_idx)
+                                                   .get_data_buffer(dst_token_idx);
+                            const auto dst_ptr = math::advance_ptr<uint64_t>(
+                                dst_token.get_base_ptr(),
+                                n_idx * static_cast<uint32_t>(sizeof(uint8_t)) + (lane_idx % 16) * static_cast<uint32_t>(sizeof(uint64_t)));
+                            *sym_buffer.map(dst_ptr, dst_rank_idx) = fp8_packed;
+
+                            // One UE8M0 SF byte per (token, 128-col block); lane 0 of each 16-lane row group writes it
+                            if ((lane_idx % 16u) == 0u) {
+                                const auto sf_token = combine_sf_buffer.get_rank_buffer(dst_topk_idx)
+                                                      .get_data_buffer(dst_token_idx);
+                                const auto sf_ptr = math::advance_ptr<uint8_t>(
+                                    sf_token.get_base_ptr(), n_block_idx * static_cast<uint32_t>(sizeof(uint8_t)));
+                                *sym_buffer.map(sf_ptr, dst_rank_idx) = sf_byte;
+                            }
+                        } else {
+                            const auto dst_token = combine_token_buffer.get_rank_buffer(dst_topk_idx)
+                                                   .get_data_buffer(dst_token_idx);
+                            const auto dst_ptr = math::advance_ptr<float4>(
+                                dst_token.get_base_ptr(),
+                                n_idx * static_cast<uint32_t>(sizeof(nv_bfloat16)) + (lane_idx % 16) * static_cast<uint32_t>(sizeof(float4)));
+                            *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
+                        }
                     }
                 }
 
@@ -1256,6 +1431,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         constexpr uint32_t kNumChunkBytes = kNumHiddenBytes / kNumChunks;
         constexpr uint32_t kNumChunkUint4 = kNumChunkBytes / sizeof(uint4);
         constexpr uint32_t kNumUint4PerLane = kNumChunkUint4 / 32;
+        // FP8 combine loads half the bytes (E4M3) and dequantizes on read; the store to `y` stays BF16.
+        // Each lane reads 8 E4M3 (a uint64) per BF16 uint4 slot, mirroring the BF16 reduced[] layout exactly.
+        constexpr uint32_t kNumLoadBytesPerChunk = kUseFp8Combine ? (kNumChunkBytes / 2) : kNumChunkBytes;
+        constexpr uint32_t kNumLoadElemsPerChunk = kHidden / kNumChunks;
         DG_STATIC_ASSERT(kHidden % kNumChunks == 0, "Hidden must be divisible by number of chunks");
         DG_STATIC_ASSERT(kNumChunkSlots * kNumEpilogueWarps * kNumHiddenBytes / kNumChunks <= SMEM_BEFORE_BARRIER_SIZE, "Hidden is too large");
         DG_STATIC_ASSERT(kNumChunkBytes % 16 == 0, "Combine chunk must be TMA-aligned (16 bytes)");
@@ -1292,11 +1471,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
             // Iterate all chunks
             for (uint32_t chunk = 0; chunk < kNumChunks; ++ chunk) {
-                const uint32_t chunk_byte_offset = chunk * kNumChunkBytes;
+                const uint32_t load_byte_offset = chunk * kNumLoadBytesPerChunk;   // source bytes (FP8: half)
+                const uint32_t store_byte_offset = chunk * kNumChunkBytes;          // dest `y` bytes (always BF16)
 
                 // Move mask and load
                 uint32_t mask = total_mask;
-                const auto move_mask_and_load = [&](const uint32_t& i) {
+                const auto move_mask_and_load = [&](const uint32_t& i) -> int {
                     if (mask) {
                         // Move
                         const uint32_t slot_idx = __ffs(mask) - 1;
@@ -1307,37 +1487,74 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             const auto src_ptr = math::advance_ptr<uint8_t>(
                                 combine_token_buffer.get_rank_buffer(slot_idx)
                                                     .get_data_buffer(token_idx).get_base_ptr(),
-                                chunk_byte_offset);
-                            ptx::tma_load_1d(combine_load_buffer[i], src_ptr, combine_load_barriers[i], kNumChunkBytes);
-                            ptx::mbarrier_arrive_and_set_tx(combine_load_barriers[i], kNumChunkBytes);
+                                load_byte_offset);
+                            ptx::tma_load_1d(combine_load_buffer[i], src_ptr, combine_load_barriers[i], kNumLoadBytesPerChunk);
+                            ptx::mbarrier_arrive_and_set_tx(combine_load_barriers[i], kNumLoadBytesPerChunk);
                         }
                         __syncwarp();
-                        return true;
+                        return static_cast<int>(slot_idx);
                     }
-                    return false;
+                    return -1;
                 };
 
-                // Load the first selection
-                bool do_reduce = move_mask_and_load(load_stage_idx);
+                // Load the first selection (returns the source slot index, or -1 when none remain)
+                int active_slot = move_mask_and_load(load_stage_idx);
 
-                // Accumulate all top-k contributions for this chunk in float registers
+                // Accumulate all top-k contributions for this chunk in float registers.
+                // `reduced[r]` always holds logical elements (2r, 2r+1), in both the BF16 and FP8 paths.
                 float2 reduced[kNumUint4PerLane * kNumElemsPerUint4] = {};
-                while (do_reduce) {
+                while (active_slot >= 0) {
                     // Prefetch next top-k into the buffer while current is being accumulated
-                    do_reduce = move_mask_and_load(load_stage_idx ^ 1);
+                    const int next_slot = move_mask_and_load(load_stage_idx ^ 1);
 
                     // Accumulate
                     combine_load_barriers[load_stage_idx]->wait(combine_phase);
-                    #pragma unroll
-                    for (uint32_t j = 0; j < kNumUint4PerLane; ++ j) {
-                        const auto uint4_values = combine_load_buffer[load_stage_idx][j * 32 + lane_idx];
-                        const auto bf16_values = reinterpret_cast<const nv_bfloat162*>(&uint4_values);
+                    if constexpr (kUseFp8Combine) {
+                        // Dequantize E4M3 with this slot's per-128 UE8M0 SF, then FMA into the accumulator.
+                        // Read 8 E4M3 (one uint64) per BF16 uint4 slot so reduced[j*4+l] maps to the same
+                        // columns as the BF16 path: (j*32+lane)*8 + 2l, +1.
+                        const uint8_t* sf_ptr = combine_sf_buffer.get_rank_buffer(active_slot)
+                                                .get_data_buffer(token_idx).get_base_ptr<uint8_t>();
+                        const uint64_t* fp8_buf = reinterpret_cast<const uint64_t*>(combine_load_buffer[load_stage_idx]);
                         #pragma unroll
-                        for (uint32_t l = 0; l < kNumElemsPerUint4; ++ l)
-                            ptx::accumulate(reduced[j * kNumElemsPerUint4 + l], bf16_values[l]);
+                        for (uint32_t j = 0; j < kNumUint4PerLane; ++ j) {
+                            const uint64_t bytes8 = fp8_buf[j * 32 + lane_idx];   // 8 E4M3 = 8 columns
+                            // The 8 columns share one 128-element SF block (col0 is a multiple of 8)
+                            const uint32_t col0 = chunk * kNumLoadElemsPerChunk + (j * 32 + lane_idx) * 8u;
+                            const float sf = math::fast_pow2(static_cast<int>(__ldg(sf_ptr + col0 / kCombineGranK)) - 127);
+                            const uint32_t lo32 = static_cast<uint32_t>(bytes8 & 0xffffffffull);
+                            const uint32_t hi32 = static_cast<uint32_t>(bytes8 >> 32);
+                            uint32_t f16_0, f16_1, f16_2, f16_3;
+                            asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(f16_0) : "h"(static_cast<uint16_t>(lo32 & 0xffffu)));
+                            asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(f16_1) : "h"(static_cast<uint16_t>(lo32 >> 16)));
+                            asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(f16_2) : "h"(static_cast<uint16_t>(hi32 & 0xffffu)));
+                            asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(f16_3) : "h"(static_cast<uint16_t>(hi32 >> 16)));
+                            const float2 f0 = __half22float2(*reinterpret_cast<const __half2*>(&f16_0));
+                            const float2 f1 = __half22float2(*reinterpret_cast<const __half2*>(&f16_1));
+                            const float2 f2 = __half22float2(*reinterpret_cast<const __half2*>(&f16_2));
+                            const float2 f3 = __half22float2(*reinterpret_cast<const __half2*>(&f16_3));
+                            float2& r0 = reduced[j * kNumElemsPerUint4 + 0];
+                            float2& r1 = reduced[j * kNumElemsPerUint4 + 1];
+                            float2& r2 = reduced[j * kNumElemsPerUint4 + 2];
+                            float2& r3 = reduced[j * kNumElemsPerUint4 + 3];
+                            r0.x = __fmaf_rn(f0.x, sf, r0.x); r0.y = __fmaf_rn(f0.y, sf, r0.y);
+                            r1.x = __fmaf_rn(f1.x, sf, r1.x); r1.y = __fmaf_rn(f1.y, sf, r1.y);
+                            r2.x = __fmaf_rn(f2.x, sf, r2.x); r2.y = __fmaf_rn(f2.y, sf, r2.y);
+                            r3.x = __fmaf_rn(f3.x, sf, r3.x); r3.y = __fmaf_rn(f3.y, sf, r3.y);
+                        }
+                    } else {
+                        #pragma unroll
+                        for (uint32_t j = 0; j < kNumUint4PerLane; ++ j) {
+                            const auto uint4_values = combine_load_buffer[load_stage_idx][j * 32 + lane_idx];
+                            const auto bf16_values = reinterpret_cast<const nv_bfloat162*>(&uint4_values);
+                            #pragma unroll
+                            for (uint32_t l = 0; l < kNumElemsPerUint4; ++ l)
+                                ptx::accumulate(reduced[j * kNumElemsPerUint4 + l], bf16_values[l]);
+                        }
                     }
                     combine_phase ^= load_stage_idx;
                     load_stage_idx ^= 1;
+                    active_slot = next_slot;
                 }
 
                 // Cast
@@ -1363,7 +1580,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 if (cute::elect_one_sync()) {
                     cute::tma_store_fence();
                     ptx::tma_store_1d(
-                        math::advance_ptr(y, static_cast<uint64_t>(token_idx) * kNumHiddenBytes + chunk_byte_offset),
+                        math::advance_ptr(y, static_cast<uint64_t>(token_idx) * kNumHiddenBytes + store_byte_offset),
                         combine_store_buffer, kNumChunkBytes);
                     cute::tma_store_arrive();
                 }

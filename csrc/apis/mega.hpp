@@ -20,16 +20,20 @@ get_symm_buffer_size_for_mega_moe(
     const int& num_ranks, const int& num_experts,
     const int& num_max_tokens_per_rank, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
-    const bool& use_fp8_dispatch, const std::string& activation) {
+    const bool& use_fp8_dispatch, const std::string& activation,
+    const bool& use_fp8_combine, const std::string& act_format) {
     DG_HOST_ASSERT(num_experts % num_ranks == 0);
 
     // Workspace bytes
     const auto workspace = layout::Workspace(nullptr, num_ranks, num_experts, num_max_tokens_per_rank, num_topk);
 
     // Layouts
-    const auto fp8_token_layout = layout::Data(hidden);
+    // Activations: FP8 E4M3 (1 byte/elem) by default, or packed MXFP4 E2M1 (hidden/2 bytes) when act_format=="mxfp4"
+    DG_HOST_ASSERT(act_format == "fp8" or act_format == "mxfp4");
+    const bool use_fp4_acts = (act_format == "mxfp4");
+    const auto act_token_layout = layout::Data(use_fp4_acts ? hidden / 2 : hidden);
     const auto bf16_token_layout = layout::Data(hidden * 2);
-    const auto fp8_intermediate_token_layout = layout::Data(intermediate_hidden);
+    const auto act_intermediate_token_layout = layout::Data(use_fp4_acts ? intermediate_hidden / 2 : intermediate_hidden);
     const auto fp8_sf_layout = layout::Data(hidden / 32);
     const auto fp8_intermediate_sf_layout = layout::Data(intermediate_hidden / 32);
     const auto input_topk_idx_layout = layout::Data(num_topk * sizeof(int64_t), false);
@@ -38,7 +42,7 @@ get_symm_buffer_size_for_mega_moe(
 
     // Input buffers
     const auto input_token_buffer = layout::Buffer(
-        fp8_token_layout, 1, num_max_tokens_per_rank,
+        act_token_layout, 1, num_max_tokens_per_rank,
         workspace.get_end_ptr());
     const auto input_sf_buffer = layout::Buffer(
         fp8_sf_layout, 1, num_max_tokens_per_rank,
@@ -62,7 +66,7 @@ get_symm_buffer_size_for_mega_moe(
 
     // L1 input buffer
     const auto l1_token_buffer = layout::Buffer(
-        fp8_token_layout, 1, num_max_pool_tokens,
+        act_token_layout, 1, num_max_pool_tokens,
         input_topk_weights_buffer.get_end_ptr());
     const auto l1_sf_buffer = layout::Buffer(
         fp8_sf_layout, 1, num_max_padded_sf_pool_tokens,
@@ -73,16 +77,24 @@ get_symm_buffer_size_for_mega_moe(
 
     // L2 input buffer
     const auto l2_token_buffer = layout::Buffer(
-        fp8_intermediate_token_layout, 1, num_max_pool_tokens,
+        act_intermediate_token_layout, 1, num_max_pool_tokens,
         l1_topk_weights_buffer.get_end_ptr());
     const auto l2_sf_buffer = layout::Buffer(
         fp8_intermediate_sf_layout, 1, num_max_padded_sf_pool_tokens,
         l2_token_buffer.get_end_ptr());
 
-    // Combine input buffer: BF16 tokens for cross-rank combine
+    // Combine input buffer: BF16 (default) or FP8 E4M3 + per-128 UE8M0 SF for cross-rank combine
+    constexpr int kCombineGranK = 128;
+    const auto combine_token_layout = use_fp8_combine ? layout::Data(hidden) : bf16_token_layout;
+    // SF bytes per token (hidden/128) may not be 16B-aligned (e.g. 7168/128=56), so disable TMA alignment
+    const auto combine_sf_layout = layout::Data(
+        use_fp8_combine ? hidden / kCombineGranK : 0, /*require_tma_alignment=*/false);
     const auto combine_token_buffer = layout::Buffer(
-        bf16_token_layout, num_topk, num_max_tokens_per_rank,
+        combine_token_layout, num_topk, num_max_tokens_per_rank,
         l2_sf_buffer.get_end_ptr());
+    const auto combine_sf_buffer = layout::Buffer(
+        combine_sf_layout, num_topk, num_max_tokens_per_rank,
+        combine_token_buffer.get_end_ptr());
 
     // Check SF buffer requirements
     DG_HOST_ASSERT(hidden % 128 == 0 and intermediate_hidden % 128 == 0);
@@ -91,10 +103,14 @@ get_symm_buffer_size_for_mega_moe(
     // Slice function: creates `(x, x_sf, topk_weights, topk_idx, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf)` tensor views from the raw buffer
     // NOTES: `x_sf` is K-major, while `l1_acts_sf` and `l2_acts_sf` are M-major
     auto slice_input_buffers = [=](const torch::Tensor& buffer) {
+        // Activation views: FP8 E4M3, or packed MXFP4 (kPackedFP4 == int8, hidden/2 elems per token)
+        const auto act_dtype = use_fp4_acts ? kPackedFP4 : torch::kFloat8_e4m3fn;
+        const int act_inner = use_fp4_acts ? hidden / 2 : hidden;
+        const int act_intermediate_inner = use_fp4_acts ? intermediate_hidden / 2 : intermediate_hidden;
         auto x = torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(input_token_buffer.base)),
-            {num_max_tokens_per_rank, hidden},
-            torch::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(buffer.device()));
+            {num_max_tokens_per_rank, act_inner},
+            torch::TensorOptions().dtype(act_dtype).device(buffer.device()));
         auto x_sf = torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(input_sf_buffer.base)),
             {num_max_tokens_per_rank, hidden / 128},
@@ -109,8 +125,8 @@ get_symm_buffer_size_for_mega_moe(
             torch::TensorOptions().dtype(torch::kFloat32).device(buffer.device()));
         auto l1_acts = torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(l1_token_buffer.base)),
-            {num_max_pool_tokens, hidden},
-            torch::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(buffer.device()));
+            {num_max_pool_tokens, act_inner},
+            torch::TensorOptions().dtype(act_dtype).device(buffer.device()));
         auto l1_acts_sf = torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(l1_sf_buffer.base)),
             {num_max_padded_sf_pool_tokens, hidden / 128},
@@ -118,8 +134,8 @@ get_symm_buffer_size_for_mega_moe(
             torch::TensorOptions().dtype(torch::kInt).device(buffer.device()));
         auto l2_acts = torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(l2_token_buffer.base)),
-            {num_max_pool_tokens, intermediate_hidden},
-            torch::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(buffer.device()));
+            {num_max_pool_tokens, act_intermediate_inner},
+            torch::TensorOptions().dtype(act_dtype).device(buffer.device()));
         auto l2_acts_sf = torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(l2_sf_buffer.base)),
             {num_max_padded_sf_pool_tokens, intermediate_hidden / 128},
@@ -127,7 +143,7 @@ get_symm_buffer_size_for_mega_moe(
             torch::TensorOptions().dtype(torch::kInt).device(buffer.device()));
         return std::make_tuple(x, x_sf, topk_idx, topk_weights, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf);
     };
-    return {reinterpret_cast<int64_t>(combine_token_buffer.get_end_ptr()), slice_input_buffers};
+    return {reinterpret_cast<int64_t>(combine_sf_buffer.get_end_ptr()), slice_input_buffers};
 }
 
 static void fp8_fp4_mega_moe(
@@ -142,7 +158,9 @@ static void fp8_fp4_mega_moe(
     const std::tuple<int, int, int>& recipe,
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
-    const bool& fast_math
+    const bool& fast_math,
+    const bool& use_fp8_combine,
+    const std::string& act_format
 ) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
@@ -193,12 +211,17 @@ static void fp8_fp4_mega_moe(
         num_ranks, num_experts,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
-        true, activation);
+        true, activation, use_fp8_combine, act_format);
     DG_HOST_ASSERT(sym_buffer.nbytes() >= static_cast<size_t>(num_required_bytes));
     DG_HOST_ASSERT(num_experts == num_experts_);
 
     // Already registered tensors
     const auto [x, x_sf, topk_idx, topk_weights, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf] = slice(sym_buffer);
+
+    // act_format is the single source of truth on the buffer: the sliced activation dtype must agree
+    const bool use_fp4_acts = (act_format == "mxfp4");
+    DG_HOST_ASSERT((l1_acts.scalar_type() == kPackedFP4) == use_fp4_acts);
+    DG_HOST_ASSERT((l2_acts.scalar_type() == kPackedFP4) == use_fp4_acts);
 
     // Dispatch into different architectures
     if (arch_major == 10) {
@@ -213,7 +236,7 @@ static void fp8_fp4_mega_moe(
                                num_experts_per_rank,
                                num_tokens, num_topk,
                                hidden, intermediate_hidden,
-                               activation_clamp, fast_math);
+                               activation_clamp, fast_math, use_fp8_combine, use_fp4_acts);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
