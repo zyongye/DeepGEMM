@@ -189,6 +189,11 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     // Per-stage: A tile + B tile + SF tiles + full/empty barriers
     const int smem_a_size_per_stage = use_mxf4_kind ? (load_block_m * block_k / 2) : (load_block_m * block_k);
     const int smem_b_size_per_stage = use_mxf4_kind ? (block_n * block_k / 2) : (block_n * block_k);
+    if (use_mxf4_kind) {
+        DG_HOST_ASSERT(smem_cd % kSmemAlignment == 0);
+        DG_HOST_ASSERT(smem_a_size_per_stage % kSmemAlignment == 0);
+        DG_HOST_ASSERT(smem_b_size_per_stage % kSmemAlignment == 0);
+    }
     const int smem_size_per_stage = smem_a_size_per_stage + smem_b_size_per_stage + smem_sfa_per_stage + smem_sfb_per_stage + 2 * 8;
 
     // Fixed total
