@@ -42,6 +42,10 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     # Settings
     is_bf16xbf16 = args.mma_type == 'bf16xbf16'
+    act_format = 'mxfp4' if args.mma_type == 'mxfp4xmxfp4' else args.act_format
+    combine_dtype = torch.float8_e4m3fn if args.combine_dtype == 'fp8' else torch.bfloat16
+    if is_bf16xbf16:
+        assert act_format == 'fp8' and combine_dtype == torch.bfloat16
     num_max_tokens_per_rank = args.num_max_tokens_per_rank
     num_tokens = max(0, args.num_max_tokens_per_rank - random.randint(0, args.num_max_removed_tokens)) \
         if args.num_tokens == 0 else args.num_tokens
@@ -55,7 +59,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         group, num_experts,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
-        mma_type=args.mma_type
+        mma_type=args.mma_type,
+        act_format=act_format,
+        combine_dtype=combine_dtype
     )
 
     # Cast weights into FP4
@@ -92,7 +98,10 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         if not is_bf16xbf16:
             # FP8 path: cast inputs to FP8/FP4 with per-32 UE8M0 SF
             assert hidden % 128 == 0 and intermediate_hidden % 128 == 0
-            x = per_token_cast_to_fp8(x, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
+            if act_format == 'mxfp4':
+                x = per_token_cast_to_fp4(x, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
+            else:
+                x = per_token_cast_to_fp8(x, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
             l1_weights = _cast_weights_to_fp4(l1_weights)
             l2_weights = _cast_weights_to_fp4(l2_weights)
 
@@ -122,6 +131,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     dist_print('Config:', once_in_node=True)
     dist_print(f' > MMA: {args.mma_type}', once_in_node=True)
+    dist_print(f' > Activations: {act_format}', once_in_node=True)
+    dist_print(f' > Combine: {args.combine_dtype}', once_in_node=True)
     dist_print(f' > Tokens: {num_tokens}/{num_max_tokens_per_rank}', once_in_node=True)
     dist_print(f' > Hidden: {hidden}', once_in_node=True)
     dist_print(f' > Intermediate: {intermediate_hidden}', once_in_node=True)
@@ -235,7 +246,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     # HBM bytes: weights + activations + output
     num_touched_experts = torch.unique(gathered_topk_idx[gathered_topk_idx >= 0]).numel()
-    act_elem_size, weight_elem_size = (2, 2) if is_bf16xbf16 else (1, 0.5)
+    act_elem_size, weight_elem_size = ((2, 2) if is_bf16xbf16 else
+                                      (0.5 if act_format == 'mxfp4' else 1, 0.5))
     num_hbm_bytes = (
         num_touched_experts * intermediate_hidden * 2 * hidden * weight_elem_size   # L1 weights
         + num_touched_experts * hidden * intermediate_hidden * weight_elem_size     # L2 weights
@@ -246,8 +258,10 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     )
     hbm_gbs = safe_div(num_hbm_bytes / 1e9, t_fused)
 
-    # NVLink bytes: dispatch pull + combine write-back
-    num_nvlink_bytes = num_recv_tokens * hidden * 3
+    # NVLink bytes: dispatch pull + combine write-back (including block SF payloads)
+    dispatch_bytes = 2 if is_bf16xbf16 else act_elem_size + 1 / 32
+    combine_bytes = 2 if args.combine_dtype == 'bf16' else 1 + 1 / 128
+    num_nvlink_bytes = num_recv_tokens * hidden * (dispatch_bytes + combine_bytes)
     nvlink_gbs = safe_div(num_nvlink_bytes / 1e9, t_fused)
 
     # Combine reduction (serial) time approximation
@@ -291,7 +305,13 @@ if __name__ == '__main__':
     parser.add_argument('--num-topk', type=int, default=6, help='Number of expert selections')
     parser.add_argument('--masked-ratio', type=float, default=0.0, help='Mask some expert selections')
     parser.add_argument('--fast-math', type=int, default=1, help='Enable fast math (0 or 1, default: 1)')
-    parser.add_argument('--mma-type', type=str, default='fp8xfp4', help='MMA type: fp8xfp4 or bf16xbf16')
+    parser.add_argument('--mma-type', type=str, default='fp8xfp4',
+                        choices=['fp8xfp4', 'mxfp4xmxfp4', 'bf16xbf16'],
+                        help='MMA type')
+    parser.add_argument('--act-format', type=str, default='fp8', choices=['fp8', 'mxfp4'],
+                        help="Activation format: 'fp8' (E4M3) or 'mxfp4' (FP4 acts; mxf4-kind via DG_MEGA_MXF4_KIND, default on)")
+    parser.add_argument('--combine-dtype', type=str, default='bf16', choices=['bf16', 'fp8'],
+                        help='Cross-rank combine payload type')
 
     # Test settings
     parser.add_argument('--num-correctness-tests', type=int, default=None, help='Pressure test')

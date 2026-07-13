@@ -8,8 +8,12 @@
 
 namespace deep_gemm::comm {
 
-// 60s timeout, at 2 GHz
-constexpr int64_t kNumTimeoutCycles = 60ll * 2000000000ll;
+// Barrier timeout at 2 GHz. Multi-rank JIT compilation can delay one rank's
+// launch for minutes, so keep the branch's longer default configurable.
+#ifndef DG_NVL_BARRIER_TIMEOUT_S
+#define DG_NVL_BARRIER_TIMEOUT_S 300
+#endif
+constexpr int64_t kNumTimeoutCycles = int64_t(DG_NVL_BARRIER_TIMEOUT_S) * 2000000000ll;
 
 CUTLASS_DEVICE void cluster_sync_with_relaxed_arrive() {
     // Perform cluster_sync with `barrier.cluster.arrive.relaxed`
@@ -68,15 +72,20 @@ CUTLASS_DEVICE void nvlink_barrier(const layout::Workspace& workspace,
             ptx::red_add_rel_sys(sym_buffer.map(signal_ptr, thread_idx), signal_sign ? -1 : 1);
         sync_scope();
 
-        // Update status and wait arrival
+        // Update status and wait arrival (timeout at 2 GHz, configurable
+        // via -DDG_NVL_BARRIER_TIMEOUT_S). The default exceeds the
+        // worst-case single-rank launch stall: this barrier is cross-rank,
+        // so any rank arriving late by more than the timeout fatally traps
+        // every waiting rank. Host-side JIT compilation of a new kernel
+        // variant alone can stall a rank's launch for minutes.
         if (thread_idx == 0) {
             ptx::red_add(counter_ptr, 1);
             const int target = signal_sign ? 0 : static_cast<int>(kNumRanks);
             const auto start_clock = clock64();
             while (ptx::ld_acq_sys(signal_ptr) != target) {
                 if (clock64() - start_clock >= kNumTimeoutCycles) {
-                    printf("DeepGEMM NVLink barrier timeout: rank=%d, counter=%d, signal=%d, target=%d, phase=%d, sign=%d, tag=%d\n",
-                           sym_buffer.rank_idx, *counter_ptr, ptx::ld_acq_sys(signal_ptr), target, signal_phase, signal_sign, kTag);
+                    printf("DeepGEMM NVLink barrier timeout (%ds): rank=%d, counter=%d, signal=%d, target=%d, phase=%d, sign=%d, tag=%d\n",
+                           DG_NVL_BARRIER_TIMEOUT_S, sym_buffer.rank_idx, *counter_ptr, ptx::ld_acq_sys(signal_ptr), target, signal_phase, signal_sign, kTag);
                     DG_DEVICE_ASSERT(false and "NVLink barrier timeout");
                 }
             }

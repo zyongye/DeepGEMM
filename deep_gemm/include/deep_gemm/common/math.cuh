@@ -98,6 +98,30 @@ CUTLASS_DEVICE void get_e4m3_sf_and_sf_inv(const float2& amax, float2& sf, float
     sf.y = fast_pow2(exp_y), sf_inv.y = fast_pow2(-exp_y);
 }
 
+template <bool kUseUE8M0 = true>
+CUTLASS_DEVICE void get_e2m1_sf_and_sf_inv(const float2& amax, float2& sf, float2& sf_inv) {
+    DG_STATIC_ASSERT(kUseUE8M0, "Must use UE8M0");
+    // E2M1 (FP4) finfo.max = 6, versus 448 for E4M3
+    const float2 finfo_factor = {1.0f / 6.0f, 1.0f / 6.0f};
+    const auto scaled = __fmul2_rn(amax, finfo_factor);
+    const auto exp_x = fast_log2_ceil(scaled.x);
+    const auto exp_y = fast_log2_ceil(scaled.y);
+    sf.x = fast_pow2(exp_x), sf_inv.x = fast_pow2(-exp_x);
+    sf.y = fast_pow2(exp_y), sf_inv.y = fast_pow2(-exp_y);
+}
+
+// Pack two FP32 values into two E2M1 (FP4) nibbles within a byte.
+// NOTES: PTX `cvt.rn.satfinite.e2m1x2.f32 d, b, a` places `a` (the last source) in the low nibble.
+CUTLASS_DEVICE uint32_t cvt_pack_f32_to_e2m1x2(const float& a, const float& b) {
+    uint32_t out;
+    asm volatile("{\n"
+                 ".reg .b8 byte0;\n"
+                 "cvt.rn.satfinite.e2m1x2.f32 byte0, %2, %1;\n"
+                 "cvt.u32.u8 %0, byte0;\n"
+                 "}" : "=r"(out) : "f"(a), "f"(b));
+    return out;
+}
+
 /// Reduction
 CUTLASS_DEVICE uint32_t warp_inclusive_sum(uint32_t value, const uint32_t& lane_idx) {
     #pragma unroll
