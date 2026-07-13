@@ -65,8 +65,10 @@ struct MegaMoEConfig {
 static MmaKind parse_mma_kind(const std::string& mma_type_str) {
     if (mma_type_str == "bf16xbf16")
         return MmaKind::BF16;
-    DG_HOST_ASSERT(mma_type_str == "fp8xfp4");
-    return MmaKind::MXFP8FP4;
+    if (mma_type_str == "fp8xfp4")
+        return MmaKind::MXFP8FP4;
+    DG_HOST_ASSERT(mma_type_str == "fp8xfp8");
+    return MmaKind::MXFP8FP8;
 }
 
 static int get_num_mma_elem_bytes(const MmaKind& mma_kind) {
@@ -74,7 +76,7 @@ static int get_num_mma_elem_bytes(const MmaKind& mma_kind) {
 }
 
 static bool is_mma_with_sf(const MmaKind& mma_kind) {
-    return mma_kind == MmaKind::MXFP8FP4;
+    return mma_kind != MmaKind::BF16;
 }
 
 static int get_num_wave_pool_tokens(
@@ -258,8 +260,8 @@ static MegaMoEConfig get_mega_moe_config(
     const int load_block_m = block_m / 2;
     const int load_block_n = block_n;
     const auto [sf_block_m, sf_block_n] = is_mma_with_sf(mma_kind) ?
-        SM100ArchSpec::get_sf_uttcp_aligned_block_sizes(block_m, block_n, MmaKind::MXFP8FP4) : std::pair(0, 0);
-    // NOTES: FP8 activations and FP4 weights (unpacked to 8-bit in smem) both use 128B swizzle
+        SM100ArchSpec::get_sf_uttcp_aligned_block_sizes(block_m, block_n, mma_kind) : std::pair(0, 0);
+    // NOTES: FP8 activations and FP4/FP8 weights (FP4 is unpacked to 8-bit in smem) use 128B swizzle
     const int swizzle_acts_mode = 128;
     const int swizzle_weights_mode = 128;
     const int gran_k = 32;

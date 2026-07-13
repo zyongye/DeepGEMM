@@ -23,7 +23,10 @@ public:
         int hidden, intermediate_hidden;
         int num_experts, num_topk;
         int num_ranks;
+        at::ScalarType weight_dtype;
         float activation_clamp;
+        float activation_alpha;
+        float activation_beta;
         bool fast_math;
         MegaMoEConfig config;
 
@@ -70,6 +73,8 @@ static void __instantiate_kernel() {{
         {}, {}, {},
         {}, {},
         {},
+        {},
+        {}, {},
         {}
     >);
 }};
@@ -86,7 +91,10 @@ static void __instantiate_kernel() {{
     args.config.num_bytes_per_pull,
     args.config.num_dispatch_threads, args.config.num_non_epilogue_threads, args.config.num_epilogue_threads,
     args.launch_args.grid_dim.first, args.num_ranks,
+    to_string(args.weight_dtype),
     to_string(args.activation_clamp),
+    to_string(args.activation_alpha),
+    to_string(args.activation_beta),
     args.fast_math ? "true" : "false");
     }
 
@@ -123,19 +131,23 @@ static void sm100_fp8_fp4_mega_moe(
     const int& num_tokens, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
     const float& activation_clamp,
+    const float& activation_alpha,
+    const float& activation_beta,
     const bool& fast_math
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
     const auto num_ring_tokens = static_cast<int>(l1_acts.size(0));
     const auto num_sf_ring_tokens = static_cast<int>(l1_acts_sf.size(0));
+    const auto weight_dtype = l1_weights.scalar_type();
+    const auto mma_kind = weight_dtype == kPackedFP4 ? MmaKind::MXFP8FP4 : MmaKind::MXFP8FP8;
 
     // Heuristics
     const auto config = get_mega_moe_config(
         num_ranks, num_experts, num_experts_per_rank,
         num_max_tokens_per_rank, num_tokens, num_topk, hidden, intermediate_hidden,
         num_ring_tokens, num_sf_ring_tokens,
-        MmaKind::MXFP8FP4);
+        mma_kind);
 
     // Make tensormap
     constexpr int kGranK = 32;
@@ -201,7 +213,10 @@ static void sm100_fp8_fp4_mega_moe(
         .hidden = hidden, .intermediate_hidden = intermediate_hidden,
         .num_experts = num_experts, .num_topk = num_topk,
         .num_ranks = num_ranks,
+        .weight_dtype = weight_dtype,
         .activation_clamp = activation_clamp,
+        .activation_alpha = activation_alpha,
+        .activation_beta = activation_beta,
         .fast_math = fast_math,
         .config = config,
         .y = y.data_ptr(),
@@ -223,7 +238,9 @@ static void sm100_fp8_fp4_mega_moe(
     };
 
     const auto code = SM100FP8FP4MegaMoERuntime::generate(args);
-    const auto runtime = compiler->build("sm100_fp8_fp4_mega_moe", code);
+    const auto kernel_name = weight_dtype == kPackedFP4 ?
+        "sm100_fp8_fp4_mega_moe" : "sm100_fp8_fp8_mega_moe";
+    const auto runtime = compiler->build(kernel_name, code);
     SM100FP8FP4MegaMoERuntime::launch(runtime, args);
 }
 

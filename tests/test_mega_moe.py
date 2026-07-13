@@ -42,6 +42,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     # Settings
     is_bf16xbf16 = args.mma_type == 'bf16xbf16'
+    is_fp8xfp8 = args.mma_type == 'fp8xfp8'
     num_max_tokens_per_rank = args.num_max_tokens_per_rank
     num_tokens = max(0, args.num_max_tokens_per_rank - random.randint(0, args.num_max_removed_tokens)) \
         if args.num_tokens == 0 else args.num_tokens
@@ -58,13 +59,22 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         mma_type=args.mma_type
     )
 
-    # Cast weights into FP4
+    # Quantize low-precision weights
     def _cast_weights_to_fp4(bf16_weights: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         num_groups, n, k = bf16_weights.shape
         w = torch.empty((num_groups, n, k // 2), device='cuda', dtype=torch.int8)
         w_sf = torch.empty((num_groups, n, k // 32), device='cuda', dtype=torch.float)
         for i in range(num_groups):
             w[i], w_sf[i] = per_token_cast_to_fp4(bf16_weights[i], use_ue8m0=True, gran_k=32)
+        w_sf = deep_gemm.transform_sf_into_required_layout(w_sf, n, k, (1, 32), num_groups)
+        return w, w_sf
+
+    def _cast_weights_to_fp8(bf16_weights: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        num_groups, n, k = bf16_weights.shape
+        w = torch.empty((num_groups, n, k), device='cuda', dtype=torch.float8_e4m3fn)
+        w_sf = torch.empty((num_groups, n, k // 32), device='cuda', dtype=torch.float)
+        for i in range(num_groups):
+            w[i], w_sf[i] = per_token_cast_to_fp8(bf16_weights[i], use_ue8m0=True, gran_k=32)
         w_sf = deep_gemm.transform_sf_into_required_layout(w_sf, n, k, (1, 32), num_groups)
         return w, w_sf
 
@@ -90,11 +100,12 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             topk_weights.masked_fill_(topk_idx < 0, 0)
 
         if not is_bf16xbf16:
-            # FP8 path: cast inputs to FP8/FP4 with per-32 UE8M0 SF
+            # FP8 path: cast inputs and weights with per-32 UE8M0 SF
             assert hidden % 128 == 0 and intermediate_hidden % 128 == 0
             x = per_token_cast_to_fp8(x, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
-            l1_weights = _cast_weights_to_fp4(l1_weights)
-            l2_weights = _cast_weights_to_fp4(l2_weights)
+            cast_weights = _cast_weights_to_fp8 if is_fp8xfp8 else _cast_weights_to_fp4
+            l1_weights = cast_weights(l1_weights)
+            l2_weights = cast_weights(l2_weights)
 
         transformed_l1_weights, transformed_l2_weights = (
             deep_gemm.transform_weights_for_mega_moe(l1_weights, l2_weights))
@@ -116,12 +127,19 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             sym_buffer=buffer,
             cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats_fused,
             activation_clamp=args.activation_clamp,
-            fast_math=bool(args.fast_math))
-        (deep_gemm.bf16_mega_moe if is_bf16xbf16 else deep_gemm.fp8_fp4_mega_moe)(**kernel_kwargs)
+            fast_math=bool(args.fast_math),
+            activation_alpha=args.activation_alpha,
+            activation_beta=args.activation_beta)
+        kernel_fn = (deep_gemm.bf16_mega_moe if is_bf16xbf16 else
+                     deep_gemm.fp8_fp8_mega_moe if is_fp8xfp8 else
+                     deep_gemm.fp8_fp4_mega_moe)
+        kernel_fn(**kernel_kwargs)
         return y, cumulative_local_expert_recv_stats_fused
 
     dist_print('Config:', once_in_node=True)
     dist_print(f' > MMA: {args.mma_type}', once_in_node=True)
+    dist_print(f' > SwiGLU: limit={args.activation_clamp}, alpha={args.activation_alpha}, beta={args.activation_beta}',
+               once_in_node=True)
     dist_print(f' > Tokens: {num_tokens}/{num_max_tokens_per_rank}', once_in_node=True)
     dist_print(f' > Hidden: {hidden}', once_in_node=True)
     dist_print(f' > Intermediate: {intermediate_hidden}', once_in_node=True)
@@ -191,6 +209,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 avail_tokens=handle.psum_num_recv_tokens_per_expert[-1],
                 num_per_channels=32, use_col_major_scales=True,
                 clamp_value=args.activation_clamp, fast_math=bool(args.fast_math),
+                alpha=args.activation_alpha, beta=args.activation_beta,
                 **swiglu_kwargs)
             l1_y = swiglu_result[-1] if is_bf16xbf16 else swiglu_result
 
@@ -235,7 +254,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     # HBM bytes: weights + activations + output
     num_touched_experts = torch.unique(gathered_topk_idx[gathered_topk_idx >= 0]).numel()
-    act_elem_size, weight_elem_size = (2, 2) if is_bf16xbf16 else (1, 0.5)
+    act_elem_size, weight_elem_size = ((2, 2) if is_bf16xbf16 else
+                                      (1, 1) if is_fp8xfp8 else
+                                      (1, 0.5))
     num_hbm_bytes = (
         num_touched_experts * intermediate_hidden * 2 * hidden * weight_elem_size   # L1 weights
         + num_touched_experts * hidden * intermediate_hidden * weight_elem_size     # L2 weights
@@ -287,11 +308,15 @@ if __name__ == '__main__':
     parser.add_argument('--hidden', type=int, default=7168, help='Hidden size')
     parser.add_argument('--intermediate-hidden', type=int, default=3072, help='Intermediate hidden size')
     parser.add_argument('--activation-clamp', type=float, default=10, help='Clamp value for activation')
+    parser.add_argument('--activation-alpha', type=float, default=1.0, help='SwiGLU sigmoid scale')
+    parser.add_argument('--activation-beta', type=float, default=0.0, help='SwiGLU up-projection bias')
     parser.add_argument('--num-experts', type=int, default=384, help='Number of experts')
     parser.add_argument('--num-topk', type=int, default=6, help='Number of expert selections')
     parser.add_argument('--masked-ratio', type=float, default=0.0, help='Mask some expert selections')
     parser.add_argument('--fast-math', type=int, default=1, help='Enable fast math (0 or 1, default: 1)')
-    parser.add_argument('--mma-type', type=str, default='fp8xfp4', help='MMA type: fp8xfp4 or bf16xbf16')
+    parser.add_argument('--mma-type', type=str, default='fp8xfp4',
+                        choices=('fp8xfp4', 'fp8xfp8', 'bf16xbf16'),
+                        help='MMA type')
 
     # Test settings
     parser.add_argument('--num-correctness-tests', type=int, default=None, help='Pressure test')

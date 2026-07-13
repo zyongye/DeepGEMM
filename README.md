@@ -113,16 +113,17 @@ For more details and the paged version `fp8_paged_mqa_logits`, please refer to `
 
 #### Mega MoE
 
-Mega MoE fuses and overlaps EP dispatch, linear 1 (FP8xFP4), SwiGLU, linear 2 (FP8xFP4), and EP combine into a single mega-kernel, overlapping NVLink communication and tensor core computation. It requires multi-process launch with symmetric memory. Usage:
+Mega MoE fuses and overlaps EP dispatch, linear 1, SwiGLU, linear 2, and EP combine into a single mega-kernel, overlapping NVLink communication and tensor core computation. It supports FP8 activations with either FP4 or FP8 weights, as well as BF16 activations and weights. It requires multi-process launch with symmetric memory. Usage:
 
 ```python
 # Allocate symmetric memory buffer
 # NOTES: requires PyTorch >= 2.9
 buffer = deep_gemm.get_symm_buffer_for_mega_moe(
-    group, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden
+    group, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden,
+    mma_type='fp8xfp8',
 )
 
-# Transform weights (FP4 with UE8M0 SF) into the required layout
+# Transform FP8 weights with UE8M0 SF into the required layout
 transformed_l1, transformed_l2 = deep_gemm.transform_weights_for_mega_moe(l1_weights, l2_weights)
 
 # Copy inputs into the buffer before each call
@@ -133,8 +134,12 @@ buffer.topk_idx[:num_tokens].copy_(topk_idx)
 buffer.topk_weights[:num_tokens].copy_(topk_weights)
 
 # Run the fused mega MoE kernel
+# SwiGLU computes gate * sigmoid(alpha * gate) * (up + beta) after clamping.
 y = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
-deep_gemm.fp8_fp4_mega_moe(y, transformed_l1, transformed_l2, buffer)
+deep_gemm.fp8_fp8_mega_moe(
+    y, transformed_l1, transformed_l2, buffer,
+    activation_clamp=7.0, activation_alpha=1.72, activation_beta=1.0,
+)
 ```
 
 For the full example with multi-process setup and benchmarking, please refer to `tests/test_mega_moe.py`.

@@ -24,6 +24,8 @@ public:
         int num_experts, num_topk;
         int num_ranks;
         float activation_clamp;
+        float activation_alpha;
+        float activation_beta;
         bool fast_math;
         MegaMoEConfig config;
 
@@ -63,6 +65,7 @@ static void __instantiate_kernel() {{
         {},
         {}, {}, {},
         {}, {},
+        {}, {},
         {},
         {}
     >);
@@ -79,6 +82,8 @@ static void __instantiate_kernel() {{
     args.config.num_dispatch_threads, args.config.num_non_epilogue_threads, args.config.num_epilogue_threads,
     args.launch_args.grid_dim.first, args.num_ranks,
     to_string(args.activation_clamp),
+    to_string(args.activation_alpha),
+    to_string(args.activation_beta),
     args.fast_math ? "true" : "false");
     }
 
@@ -109,6 +114,8 @@ static void sm100_bf16_mega_moe(
     const int& num_tokens, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
     const float& activation_clamp,
+    const float& activation_alpha,
+    const float& activation_beta,
     const bool& fast_math
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
@@ -161,6 +168,8 @@ static void sm100_bf16_mega_moe(
         .num_experts = num_experts, .num_topk = num_topk,
         .num_ranks = num_ranks,
         .activation_clamp = activation_clamp,
+        .activation_alpha = activation_alpha,
+        .activation_beta = activation_beta,
         .fast_math = fast_math,
         .config = config,
         .y = y.data_ptr(),
