@@ -134,10 +134,10 @@ CUTLASS_GLOBAL void transpose_and_pack_fp32_into_ue8m0(float* sf, uint32_t* out,
 
         // Pack and store
         uint32_t packed = 0;
-        packed |= (values[0] >> 23u);
-        packed |= (values[1] >> 15u);
-        packed |= (values[2] >>  7u);
-        packed |= (values[3] <<  1u);
+        packed |= (values[0] >> 23u) & 0x000000ffu;
+        packed |= (values[1] >> 15u) & 0x0000ff00u;
+        packed |= (values[2] >>  7u) & 0x00ff0000u;
+        packed |= (values[3] <<  1u) & 0xff000000u;
         // Write safe finite scale codes for PSUM gap rows; UE8M0 0xff is NaN.
         if (in_bounds_mn)
             out[sf_k_pack_idx * tma_aligned_mn + global_mn_idx] = packed;
@@ -239,10 +239,14 @@ CUTLASS_GLOBAL void pack_fp32_into_ue8m0(float* sf, uint32_t* out, uint32_t* gro
 
         // Pack and store
         uint4 packed;
-        packed.x = (values[0].x >> 23u) | (values[1].x >> 15u) | (values[2].x >> 7u) | (values[3].x << 1u);
-        packed.y = (values[0].y >> 23u) | (values[1].y >> 15u) | (values[2].y >> 7u) | (values[3].y << 1u);
-        packed.z = (values[0].z >> 23u) | (values[1].z >> 15u) | (values[2].z >> 7u) | (values[3].z << 1u);
-        packed.w = (values[0].w >> 23u) | (values[1].w >> 15u) | (values[2].w >> 7u) | (values[3].w << 1u);
+        packed.x = ((values[0].x >> 23u) & 0x000000ffu) | ((values[1].x >> 15u) & 0x0000ff00u) |
+                   ((values[2].x >>  7u) & 0x00ff0000u) | ((values[3].x <<  1u) & 0xff000000u);
+        packed.y = ((values[0].y >> 23u) & 0x000000ffu) | ((values[1].y >> 15u) & 0x0000ff00u) |
+                   ((values[2].y >>  7u) & 0x00ff0000u) | ((values[3].y <<  1u) & 0xff000000u);
+        packed.z = ((values[0].z >> 23u) & 0x000000ffu) | ((values[1].z >> 15u) & 0x0000ff00u) |
+                   ((values[2].z >>  7u) & 0x00ff0000u) | ((values[3].z <<  1u) & 0xff000000u);
+        packed.w = ((values[0].w >> 23u) & 0x000000ffu) | ((values[1].w >> 15u) & 0x0000ff00u) |
+                   ((values[2].w >>  7u) & 0x00ff0000u) | ((values[3].w <<  1u) & 0xff000000u);
         reinterpret_cast<uint4*>(out + packed_sf_k_idx * mn)[mn_idx] = packed;
     }
 }
