@@ -42,6 +42,17 @@ def get_mn_major_tma_aligned_packed_ue8m0_tensor_torch_impl(x: torch.Tensor) -> 
     return aligned_x.squeeze(0) if remove_dim else aligned_x
 
 
+def test_non_pow2_ue8m0_scales() -> None:
+    mn, k = 32, 12
+    fp32_sf = torch.linspace(0.5, 7.5, mn * k, dtype=torch.float, device='cuda').view(mn, k)
+    fp32_bits = fp32_sf.view(torch.int)
+    assert torch.any((fp32_bits & 0x007fffff) != 0)
+
+    packed_sf = get_mn_major_tma_aligned_packed_ue8m0_tensor(fp32_sf)
+    ref_packed_sf = get_mn_major_tma_aligned_packed_ue8m0_tensor_torch_impl(fp32_sf)
+    assert torch.equal(packed_sf, ref_packed_sf)
+
+
 def test_sf_layout_kernels() -> None:
     print('Testing SF layout kernels:')
     for mn, k, with_transpose, use_ue8m0, num_groups, gran_k in enumerate_sf_layout():
@@ -155,6 +166,7 @@ if __name__ == '__main__':
     torch.manual_seed(1)
     random.seed(1)
 
+    test_non_pow2_ue8m0_scales()
     test_sf_layout_kernels()
     test_k_grouped_sf_layout_kernels()
     test_k_grouped_psum_sf_layout_kernels()
