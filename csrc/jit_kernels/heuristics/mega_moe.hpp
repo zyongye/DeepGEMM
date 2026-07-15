@@ -31,7 +31,7 @@ struct MegaMoEConfig {
     // Swizzle modes for TMA descriptors
     int swizzle_acts_mode, swizzle_weights_mode;
 
-    // Number of experts to process per wave
+    // Number of experts to process per fixed wave
     int num_experts_per_wave;
 
     // Pipeline stages and shared memory

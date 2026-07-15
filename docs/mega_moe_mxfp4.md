@@ -50,7 +50,10 @@ SwiGLU convention: the first `intermediate` rows of L1 are the **gate**, the nex
 
 ### Internal (the kernel manages these; the engine does not touch them)
 
-- L1 output / L2 input activations: packed E2M1 (`intermediate/2` bytes/token) when MXFP4.
+- L1 output / L2 input activations: packed E2M1 (`intermediate/2` payload bytes/token)
+  when MXFP4. The buffer may use either a compact pitch or a padded
+  `intermediate`-byte pitch; the host and JIT apply the same GB300-tuned choice for the
+  rank count, token capacity, and combine format.
 - Combine buffer: BF16 `[num_topk, num_max_tokens, hidden]`, or E4M3 `[..., hidden]` +
   a parallel per-128 UE8M0 SF slot when `combine_dtype=float8_e4m3fn`.
 
@@ -60,6 +63,12 @@ When MXFP4 acts are on, the L1/L2 GEMMs run the dense `tcgen05.mma.kind::mxf4.bl
 (K=64, 2 nibbles/byte smem) by default; set `DG_MEGA_MXF4_KIND=0` to force the
 `kind::mxf8f6f4` path (K=32, unpacked smem). **Numerics are identical** (both block-32
 E2M1) — this only affects speed, and is shape-dependent (helps GEMM-bound/prefill shapes).
+
+Expert-wave boundaries remain fixed for each JIT-compiled kernel. The host heuristic
+reserves a 2x occupancy margin for uneven routing and caps each wave to the ring-buffer
+capacity, but it cannot see the finalized runtime distribution. Use the `--routing-skew`
+sweep in `mega_moe_benchmark.md` to catch model-specific hot-expert regressions at low
+concurrency.
 
 ---
 

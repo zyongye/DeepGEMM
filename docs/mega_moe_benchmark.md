@@ -101,10 +101,36 @@ new machine before trusting perf numbers.
 real multi-GPU a2a path, use the multi-process harness:
 
 ```bash
-torchrun --nproc_per_node=8 tests/test_mega_moe.py
+PYTHONPATH=$PWD python tests/test_mega_moe.py --num-processes 8
 ```
 
 (Set `MASTER_ADDR`/`MASTER_PORT` if the default `127.0.0.1:8361` is taken.)
+
+### Low-concurrency routing-imbalance sweep
+
+The default router logits are statistically uniform. Use `--routing-skew` to repeat a
+hot-to-cold local-expert bias on every EP rank. This keeps traffic balanced across ranks
+while exercising the within-rank imbalance seen with real router outputs. The harness
+prints the active-expert count and max/mean expert load before timing.
+
+```bash
+for tokens in 32 64 128 256; do
+    PYTHONPATH=$PWD python tests/test_mega_moe.py \
+        --num-processes 8 \
+        --num-max-tokens-per-rank 384 \
+        --num-tokens "$tokens" \
+        --hidden 7168 \
+        --intermediate-hidden 3072 \
+        --num-experts 384 \
+        --num-topk 6 \
+        --mma-type mxfp4xmxfp4 \
+        --combine-dtype bf16 \
+        --routing-skew 0.5
+done
+```
+
+Run the same sweep with `--routing-skew 0` for the uniform control. Values around
+`0.25` are moderately skewed; `0.5` is intentionally stressful.
 
 ## 6. Optional: compare against the SGL DeepGEMM PR
 

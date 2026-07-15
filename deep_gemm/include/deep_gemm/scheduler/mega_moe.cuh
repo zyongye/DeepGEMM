@@ -69,7 +69,10 @@ struct MegaMoEScheduler {
     }
 
     CUTLASS_DEVICE uint32_t get_num_tokens(const uint32_t& expert_idx) const {
-        uint32_t valid_value;
+        if (expert_idx >= kNumExpertsPerRank)
+            return 0;
+
+        uint32_t valid_value = 0;
         #pragma unroll
         for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
             valid_value = (expert_idx == i * 32 + ptx::get_lane_idx()) ?

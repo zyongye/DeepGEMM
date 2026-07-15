@@ -86,6 +86,13 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         l2_weights = torch.randn(
             (num_experts_per_rank, hidden, intermediate_hidden), dtype=torch.bfloat16, device='cuda')
         scores = torch.randn((num_tokens, num_experts), dtype=torch.float, device='cuda')
+        if args.routing_skew > 0:
+            # Repeat the same local-expert bias on every EP rank so traffic
+            # remains rank-balanced while the experts within each rank are
+            # realistically imbalanced. Larger values make low-index experts
+            # hotter; zero retains the original uniform benchmark.
+            local_expert_idx = torch.arange(num_experts, device='cuda') % num_experts_per_rank
+            scores -= args.routing_skew * torch.log1p(local_expert_idx.float()).unsqueeze(0)
         topk_weights, topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=False)
         cumulative_local_expert_recv_stats_fused = torch.randint(
             0, 100, (num_experts_per_rank, ), dtype=torch.int, device='cuda')
@@ -232,6 +239,14 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     gathered_topk_idx[(gathered_topk_idx < rank_idx * num_experts_per_rank) | \
                       (gathered_topk_idx >= (rank_idx + 1) * num_experts_per_rank)] = -1
     num_recv_tokens = (gathered_topk_idx != -1).sum().item()
+    local_expert_idx = gathered_topk_idx[gathered_topk_idx >= 0] - rank_idx * num_experts_per_rank
+    expert_counts = torch.bincount(local_expert_idx, minlength=num_experts_per_rank)
+    num_touched_experts = (expert_counts > 0).sum().item()
+    mean_expert_tokens = num_recv_tokens / num_experts_per_rank
+    max_expert_tokens = expert_counts.max().item() if expert_counts.numel() > 0 else 0
+    imbalance = max_expert_tokens / mean_expert_tokens if mean_expert_tokens > 0 else 0
+    dist_print(f' > Routing: {num_touched_experts}/{num_experts_per_rank} active experts, '
+               f'max/mean load {imbalance:.2f}x', once_in_node=True)
 
     # Benchmark
     t_fused = bench_kineto(
@@ -245,7 +260,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     tflops = safe_div(2 * num_recv_tokens * (hidden * intermediate_hidden * 3) / 1e12, t_fused)
 
     # HBM bytes: weights + activations + output
-    num_touched_experts = torch.unique(gathered_topk_idx[gathered_topk_idx >= 0]).numel()
     act_elem_size, weight_elem_size = ((2, 2) if is_bf16xbf16 else
                                       (0.5 if act_format == 'mxfp4' else 1, 0.5))
     num_hbm_bytes = (
@@ -304,6 +318,8 @@ if __name__ == '__main__':
     parser.add_argument('--num-experts', type=int, default=384, help='Number of experts')
     parser.add_argument('--num-topk', type=int, default=6, help='Number of expert selections')
     parser.add_argument('--masked-ratio', type=float, default=0.0, help='Mask some expert selections')
+    parser.add_argument('--routing-skew', type=float, default=0.0,
+                        help='Per-rank expert-bias strength for imbalanced-routing benchmarks (default: 0)')
     parser.add_argument('--fast-math', type=int, default=1, help='Enable fast math (0 or 1, default: 1)')
     parser.add_argument('--mma-type', type=str, default='fp8xfp4',
                         choices=['fp8xfp4', 'mxfp4xmxfp4', 'bf16xbf16'],
