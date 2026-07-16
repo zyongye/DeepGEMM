@@ -79,6 +79,11 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     # Settings
     is_bf16xbf16 = args.mma_type == 'bf16xbf16'
+    act_format = 'mxfp4' if args.mma_type == 'mxfp4xmxfp4' else args.act_format
+    use_fp4_acts = act_format == 'mxfp4'
+    mma_type = 'mxfp4xmxfp4' if use_fp4_acts else args.mma_type
+    combine_dtype = torch.float8_e4m3fn if args.combine_dtype == 'fp8' else torch.bfloat16
+    use_fp8_combine = combine_dtype == torch.float8_e4m3fn
     num_max_tokens_per_rank = args.num_max_tokens_per_rank
     num_tokens = max(0, args.num_max_tokens_per_rank - random.randint(0, args.num_max_removed_tokens)) \
         if args.num_tokens == 0 else args.num_tokens
@@ -88,6 +93,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     hidden, intermediate_hidden = args.hidden, args.intermediate_hidden
     shared_intermediate_hidden = intermediate_hidden * num_shared_experts
     assert num_tokens <= num_max_tokens_per_rank
+    assert not is_bf16xbf16 or (not use_fp4_acts and not use_fp8_combine)
+    assert not use_fp4_acts or num_shared_experts == 0, \
+        'Native MXFP4 currently requires --num-shared-experts 0'
 
     # Allocate symmetric memory
     buffer = deep_gemm.get_symm_buffer_for_mega_moe(
@@ -95,7 +103,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
         num_shared_experts=num_shared_experts,
-        mma_type=args.mma_type
+        mma_type=mma_type,
+        combine_dtype=combine_dtype,
+        act_format=act_format
     )
 
     # Cast weights into FP4
@@ -122,6 +132,12 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         l2_weights = torch.randn(
             (num_experts_per_rank, hidden, intermediate_hidden), dtype=torch.bfloat16, device='cuda')
         scores = torch.randn((num_tokens, num_experts), dtype=torch.float, device='cuda')
+        if args.routing_skew > 0:
+            # Keep rank-level traffic roughly balanced while making each rank's first
+            # local experts hotter. This models real routing imbalance without turning
+            # the benchmark into a single-rank communication hotspot.
+            local_expert_idx = torch.arange(num_experts, device='cuda') % num_experts_per_rank
+            scores.sub_(args.routing_skew * torch.log1p(local_expert_idx.float()).unsqueeze(0))
         topk_weights, topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=False)
         cumulative_local_expert_recv_stats_fused = torch.randint(
             0, 100, (num_experts_per_rank, ), dtype=torch.int, device='cuda')
@@ -142,15 +158,22 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             shared_l1_weights = shared_l2_weights = None
 
         if not is_bf16xbf16:
-            # FP8 path: cast inputs to FP8/FP4 with per-32 UE8M0 SF
+            # Quantized path: FP8 or packed MXFP4 activations with per-32 UE8M0 SF.
             assert hidden % 128 == 0 and intermediate_hidden % 128 == 0 and shared_intermediate_hidden % 128 == 0
             block_m = deep_gemm.get_block_m_for_mega_moe(
-                num_ranks, num_experts, buffer.num_max_tokens_per_rank, num_tokens, num_topk, args.mma_type)
-            x_fp8, x_sf, x_sf_tma = _cast_fp8_for_mega_moe(x)
-            x = (x_fp8, x_sf)
-            shared_x = (x_fp8, x_sf_tma)
-            if num_shared_experts > 0:
-                shared_l1_x_sf = _to_shared_mega_moe_sf_layout(x_sf, block_m, buffer.shared_l1_acts_sf.shape[0])
+                num_ranks, num_experts, buffer.num_max_tokens_per_rank, num_tokens, num_topk, mma_type)
+            if use_fp4_acts:
+                x_fp4, x_sf = per_token_cast_to_fp4(
+                    x, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
+                x = (x_fp4, x_sf)
+                shared_x = shared_l1_x_sf = None
+            else:
+                x_fp8, x_sf, x_sf_tma = _cast_fp8_for_mega_moe(x)
+                x = (x_fp8, x_sf)
+                shared_x = (x_fp8, x_sf_tma)
+                if num_shared_experts > 0:
+                    shared_l1_x_sf = _to_shared_mega_moe_sf_layout(
+                        x_sf, block_m, buffer.shared_l1_acts_sf.shape[0])
             l1_weights = _cast_weights_to_fp4(l1_weights)
             l2_weights = _cast_weights_to_fp4(l2_weights)
             if num_shared_experts > 0:
@@ -198,7 +221,10 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         return y, cumulative_local_expert_recv_stats_fused
 
     dist_print('Config:', once_in_node=True)
-    dist_print(f' > MMA: {args.mma_type}', once_in_node=True)
+    dist_print(f' > MMA: {mma_type}', once_in_node=True)
+    dist_print(f' > Activations: {act_format}', once_in_node=True)
+    dist_print(f' > Combine: {args.combine_dtype}', once_in_node=True)
+    dist_print(f' > Routing skew: {args.routing_skew:g}', once_in_node=True)
     dist_print(f' > Tokens: {num_tokens}/{num_max_tokens_per_rank}', once_in_node=True)
     dist_print(f' > Hidden: {hidden}', once_in_node=True)
     dist_print(f' > Intermediate: {intermediate_hidden}', once_in_node=True)
@@ -222,6 +248,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     # Non-overlapped baseline: EP dispatch + GEMM + EP combine
     deep_ep, tilelang_ops, tilelang_bench, is_legacy_loaded = import_baseline()
+    if is_legacy_loaded and (use_fp4_acts or use_fp8_combine):
+        dist_print('Legacy baseline does not support this activation/combine format; skipping it', once_in_node=True)
+        is_legacy_loaded = False
     alignment = deep_gemm.get_theoretical_mk_alignment_for_contiguous_layout()
     deep_gemm.set_mk_alignment_for_contiguous_layout(alignment)
     num_correctness_tests = 1 if args.num_correctness_tests is None else args.num_correctness_tests
@@ -335,6 +364,20 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     gathered_topk_idx[(gathered_topk_idx < rank_idx * num_experts_per_rank) | \
                       (gathered_topk_idx >= (rank_idx + 1) * num_experts_per_rank)] = -1
     num_recv_tokens = (gathered_topk_idx != -1).sum().item()
+    local_expert_idx = (
+        gathered_topk_idx[gathered_topk_idx >= 0]
+        - rank_idx * num_experts_per_rank)
+    expert_counts = torch.bincount(
+        local_expert_idx, minlength=num_experts_per_rank)
+    num_touched_experts = (expert_counts > 0).sum().item()
+    mean_expert_tokens = num_recv_tokens / num_experts_per_rank
+    max_expert_tokens = expert_counts.max().item() if expert_counts.numel() else 0
+    imbalance = (
+        max_expert_tokens / mean_expert_tokens if mean_expert_tokens > 0 else 0)
+    dist_print(
+        f' > Routing: {num_touched_experts}/{num_experts_per_rank} active experts, '
+        f'max/mean load {imbalance:.2f}x',
+        once_in_node=True)
 
     # Benchmark
     barrier_fn = lambda: ep_buffer.barrier(use_comm_stream=False) if ep_buffer else dist.all_reduce(torch.empty(1, device='cuda'))
@@ -351,15 +394,15 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     num_total_flops = num_routed_flops + num_shared_flops
 
     # HBM bytes: weights + activations + output
-    num_touched_experts = torch.unique(gathered_topk_idx[gathered_topk_idx >= 0]).numel()
-    act_elem_size, weight_elem_size = (2, 2) if is_bf16xbf16 else (1, 0.5)
+    act_elem_size, weight_elem_size = (2, 2) if is_bf16xbf16 else (0.5 if use_fp4_acts else 1, 0.5)
+    l2_output_elem_size = 1 + 1 / 128 if use_fp8_combine else 2
     num_routed_hbm_bytes = (
         num_touched_experts * intermediate_hidden * 2 * hidden * weight_elem_size      # L1 weights
         + num_touched_experts * hidden * intermediate_hidden * weight_elem_size        # L2 weights
         + num_recv_tokens * hidden * act_elem_size                                     # L1 acts read
         + num_recv_tokens * intermediate_hidden * act_elem_size                        # L1 output write
         + num_recv_tokens * intermediate_hidden * act_elem_size                        # L2 acts read
-        + num_recv_tokens * hidden * 2                                                 # L2 output write (always BF16)
+        + num_recv_tokens * hidden * l2_output_elem_size                               # L2 output write
     )
     num_shared_hbm_bytes = 0 if num_shared_experts == 0 else (
         shared_intermediate_hidden * 2 * hidden * weight_elem_size      # Shared L1 weights
@@ -367,12 +410,13 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         + num_tokens * hidden * act_elem_size                           # Shared L1 acts read
         + num_tokens * shared_intermediate_hidden * act_elem_size       # Shared L1 output write
         + num_tokens * shared_intermediate_hidden * act_elem_size       # Shared L2 acts read
-        + num_tokens * hidden * 2                                       # Shared L2 output write
+        + num_tokens * hidden * l2_output_elem_size                     # Shared L2 output write
     )
     num_hbm_bytes = num_routed_hbm_bytes + num_shared_hbm_bytes
 
     # NVLink bytes: dispatch pull + combine write-back
-    num_nvlink_bytes = num_recv_tokens * hidden * 3
+    dispatch_elem_size = 2 if is_bf16xbf16 else (act_elem_size + 1 / 32)
+    num_nvlink_bytes = num_recv_tokens * hidden * (dispatch_elem_size + l2_output_elem_size)
 
     # Combine reduction (serial) time approximation
     t_reduction = num_tokens * hidden * 2 * (1 + num_topk) / 6.5e12
@@ -422,7 +466,15 @@ if __name__ == '__main__':
     parser.add_argument('--num-topk', type=int, default=6, help='Number of expert selections')
     parser.add_argument('--masked-ratio', type=float, default=0.0, help='Mask some expert selections')
     parser.add_argument('--fast-math', type=int, default=1, help='Enable fast math (0 or 1, default: 1)')
-    parser.add_argument('--mma-type', type=str, default='fp8xfp4', help='MMA type: fp8xfp4 or bf16xbf16')
+    parser.add_argument(
+        '--mma-type', choices=('fp8xfp4', 'mxfp4xmxfp4', 'bf16xbf16'), default='fp8xfp4',
+        help='MMA type (mxfp4xmxfp4 implies --act-format mxfp4)')
+    parser.add_argument('--act-format', choices=('fp8', 'mxfp4'), default='fp8',
+                        help='Routed activation format')
+    parser.add_argument('--combine-dtype', choices=('bf16', 'fp8'), default='bf16',
+                        help='Wire format for routed/shared L2 outputs before combine')
+    parser.add_argument('--routing-skew', type=float, default=0.0,
+                        help='Log-bias toward low local expert IDs; 0 is uniform')
 
     # Test settings
     parser.add_argument('--num-correctness-tests', type=int, default=None, help='Pressure test')

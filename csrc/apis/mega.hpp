@@ -26,8 +26,11 @@ static int get_block_m_for_mega_moe(
     const std::string& mma_type) {
     DG_HOST_ASSERT(num_tokens >= 0);
     const auto mma_kind = parse_mma_kind(mma_type);
+    const bool use_mxf4_kind = mma_type == "mxfp4xmxfp4";
     const auto [cluster_size, block_m, store_block_m, block_k, num_epilogue_threads] =
-        get_block_config_for_mega_moe(num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens, mma_kind);
+        get_block_config_for_mega_moe(
+            num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens,
+            mma_kind, use_mxf4_kind);
     return block_m;
 }
 
@@ -39,10 +42,13 @@ get_symm_buffer_size_for_mega_moe(
     const int& num_max_tokens_per_rank, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
     const std::string& mma_type, const std::string& activation,
-    const int& num_shared_experts = 0) {
+    const int& num_shared_experts = 0,
+    const bool& use_fp8_combine = false,
+    const std::string& act_format = "fp8") {
     DG_HOST_ASSERT(num_experts % num_ranks == 0);
     DG_HOST_ASSERT(activation == "swiglu");
     DG_HOST_ASSERT(num_shared_experts >= 0);
+    DG_HOST_ASSERT(act_format == "fp8" or act_format == "mxfp4");
 
     // Ring capacity: worst-case live pool blocks over all candidate BLOCK_M; mirrors the kernel assert.
     // TODO: we temporarily assume the SM count is consistent with the runtime value
@@ -67,6 +73,10 @@ get_symm_buffer_size_for_mega_moe(
     // Parse MMA type
     const auto mma_kind = parse_mma_kind(mma_type);
     const auto with_sf = is_mma_with_sf(mma_kind);
+    const bool use_fp4_acts = act_format == "mxfp4";
+    DG_HOST_ASSERT(not use_fp4_acts or with_sf);
+    DG_HOST_ASSERT(not use_fp8_combine or with_sf);
+    DG_HOST_ASSERT(not use_fp4_acts or num_shared_experts == 0);
 
     // Compute num_sf_ring_tokens (max across all candidate block sizes)
     int num_sf_ring_tokens = 0;
@@ -83,7 +93,7 @@ get_symm_buffer_size_for_mega_moe(
         nullptr, hidden, intermediate_hidden,
         num_ranks, num_experts, num_max_tokens_per_rank,
         num_topk, num_ring_tokens, num_sf_ring_tokens, with_sf,
-        num_shared_experts
+        num_shared_experts, use_fp4_acts, use_fp8_combine
     );
 
     // Check SF buffer requirements
@@ -96,10 +106,12 @@ get_symm_buffer_size_for_mega_moe(
     // Slice function: creates tensor views from the raw buffer.
     // NOTES: `x_sf` is K-major, while `l1_acts_sf` and `l2_acts_sf` are M-major
     auto slice_input_buffers = [=](const torch::Tensor& buffer) {
+        const auto activation_dtype = use_fp4_acts ? kPackedFP4 :
+            (with_sf ? torch::kFloat8_e4m3fn : torch::kBFloat16);
         auto x = torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(mega_buffer.input_token_buffer.base)),
-            {num_max_tokens_per_rank, hidden},
-            torch::TensorOptions().dtype(with_sf ? torch::kFloat8_e4m3fn : torch::kBFloat16).device(buffer.device()));
+            {num_max_tokens_per_rank, use_fp4_acts ? hidden / 2 : hidden},
+            torch::TensorOptions().dtype(activation_dtype).device(buffer.device()));
         auto x_sf = with_sf ? torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(mega_buffer.input_sf_buffer.base)),
             {num_max_tokens_per_rank, hidden / 128},
@@ -121,8 +133,8 @@ get_symm_buffer_size_for_mega_moe(
             torch::TensorOptions().dtype(torch::kInt).device(buffer.device())) : torch::Tensor();
         auto shared_l2_acts = num_shared_experts > 0 ? torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(mega_buffer.shared_l2_token_buffer.base)),
-            {num_max_tokens_per_rank, shared_intermediate_hidden},
-            torch::TensorOptions().dtype(with_sf ? torch::kFloat8_e4m3fn : torch::kBFloat16).device(buffer.device())) : torch::Tensor();
+            {num_max_tokens_per_rank, use_fp4_acts ? shared_intermediate_hidden / 2 : shared_intermediate_hidden},
+            torch::TensorOptions().dtype(activation_dtype).device(buffer.device())) : torch::Tensor();
         auto shared_l2_acts_sf = (with_sf and num_shared_experts > 0) ? torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(mega_buffer.shared_l2_sf_buffer.base)),
             {layout::get_num_max_shared_sf_tokens(num_max_tokens_per_rank), shared_intermediate_hidden / 128},
@@ -131,8 +143,8 @@ get_symm_buffer_size_for_mega_moe(
 
         auto l1_acts = torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(mega_buffer.l1_token_buffer.base)),
-            {num_ring_tokens, hidden},
-            torch::TensorOptions().dtype(with_sf ? torch::kFloat8_e4m3fn : torch::kBFloat16).device(buffer.device()));
+            {num_ring_tokens, use_fp4_acts ? hidden / 2 : hidden},
+            torch::TensorOptions().dtype(activation_dtype).device(buffer.device()));
         auto l1_acts_sf = with_sf ? torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(mega_buffer.l1_sf_buffer.base)),
             {num_sf_ring_tokens, hidden / 128},
@@ -140,8 +152,8 @@ get_symm_buffer_size_for_mega_moe(
             torch::TensorOptions().dtype(torch::kInt).device(buffer.device())) : torch::Tensor();
         auto l2_acts = torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(mega_buffer.l2_token_buffer.base)),
-            {num_ring_tokens, intermediate_hidden},
-            torch::TensorOptions().dtype(with_sf ? torch::kFloat8_e4m3fn : torch::kBFloat16).device(buffer.device()));
+            {num_ring_tokens, use_fp4_acts ? intermediate_hidden / 2 : intermediate_hidden},
+            torch::TensorOptions().dtype(activation_dtype).device(buffer.device()));
         auto l2_acts_sf = with_sf ? torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(mega_buffer.l2_sf_buffer.base)),
             {num_sf_ring_tokens, intermediate_hidden / 128},
@@ -168,7 +180,9 @@ static void fp8_fp4_mega_moe(
     const std::tuple<int, int, int>& recipe,
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
-    const bool& fast_math
+    const bool& fast_math,
+    const bool& use_fp8_combine,
+    const std::string& act_format
 ) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
@@ -178,7 +192,9 @@ static void fp8_fp4_mega_moe(
     const auto [rm, rn, rk] = recipe;
     DG_HOST_ASSERT(rm == 1 and rn == 1 and rk == 32);
     DG_HOST_ASSERT(activation == "swiglu");
+    DG_HOST_ASSERT(act_format == "fp8" or act_format == "mxfp4");
     DG_HOST_ASSERT(shared_l1_weights_tuple_opt.has_value() == shared_l2_weights_tuple_opt.has_value());
+    const bool use_fp4_acts = act_format == "mxfp4";
 
     // Activation checks
     const auto activation_clamp =
@@ -231,6 +247,7 @@ static void fp8_fp4_mega_moe(
         check_sf_layout(shared_l2_weights_sf, hidden, shared_intermediate_hidden, kGranMN, kGranK,
                         std::nullopt, true, false, torch::kInt);
     }
+    DG_HOST_ASSERT(not use_fp4_acts or num_shared_experts == 0);
 
     // Check stats counter
     if (cumulative_local_expert_recv_stats.has_value()) {
@@ -246,7 +263,8 @@ static void fp8_fp4_mega_moe(
         num_ranks, num_experts,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
-        "fp8xfp4", activation, num_shared_experts
+        use_fp4_acts ? "mxfp4xmxfp4" : "fp8xfp4", activation, num_shared_experts,
+        use_fp8_combine, act_format
     );
     DG_HOST_ASSERT(sym_buffer.nbytes() >= static_cast<size_t>(num_required_bytes));
     DG_HOST_ASSERT(num_experts == num_experts_);
@@ -274,7 +292,8 @@ static void fp8_fp4_mega_moe(
                                num_shared_experts,
                                num_tokens, num_topk,
                                hidden, intermediate_hidden,
-                               activation_clamp, fast_math);
+                               activation_clamp, fast_math,
+                               use_fp4_acts, use_fp8_combine);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
