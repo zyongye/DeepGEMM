@@ -104,7 +104,7 @@ static std::tuple<int, int, int, int, int> get_block_config_for_mega_moe(
         float num_expected_tokens_per_expert = static_cast<float>(num_tokens) * num_ranks * num_topk / num_experts;
         if (num_expected_tokens_per_expert <= 8.5) {
             // Really small token-per-expert (e.g. RL long-tail rollout), use the smallest block_m and larger BLOCK_K for less synchronization
-            return (tune_mxf4_kind or tune_ep4_fp8_combine)
+            return (tune_mxf4_kind or tune_ep16_fp8_combine or tune_ep4_fp8_combine)
                 ? std::tuple<int, int, int, int, int>{2, 32, 16, 128, 2}
                 : std::tuple<int, int, int, int, int>{2, 16, 8, 256, 2};
         } else if (num_expected_tokens_per_expert <= 16.5) {
