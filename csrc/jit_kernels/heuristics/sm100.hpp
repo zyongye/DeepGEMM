@@ -19,7 +19,9 @@ struct SM100ArchSpec {
         constexpr int num_utccp_aligned_elems = 128;
         switch (mma_kind) {
             case MmaKind::BF16: return {0, 0};
-            case MmaKind::MXFP8FP4: return {align(block_m, num_utccp_aligned_elems), align(block_n, num_utccp_aligned_elems)};
+            case MmaKind::MXFP8FP4:
+            case MmaKind::MXFP8FP8:
+                return {align(block_m, num_utccp_aligned_elems), align(block_n, num_utccp_aligned_elems)};
             default: DG_HOST_UNREACHABLE("Unknown dtype");
         }
     }
@@ -122,7 +124,7 @@ struct SM100ArchSpec {
 
                             // Check tensor memory capacity
                             const auto [sf_block_m, sf_block_n] = get_sf_uttcp_aligned_block_sizes(block_m, block_n, desc.get_mma_kind());
-                            const auto tmem_sf_cols = desc.get_mma_kind() == MmaKind::MXFP8FP4 ? sf_block_m / 32 + sf_block_n / 32 : 0;
+                            const auto tmem_sf_cols = desc.get_mma_kind() != MmaKind::BF16 ? sf_block_m / 32 + sf_block_n / 32 : 0;
                             const auto umma_n = swap_ab ? block_m : block_n;
                             if (2 * umma_n + tmem_sf_cols > 512)
                                 continue;

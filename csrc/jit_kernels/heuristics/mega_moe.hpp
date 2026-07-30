@@ -61,8 +61,10 @@ struct MegaMoEConfig {
 static MmaKind parse_mma_kind(const std::string& mma_type_str) {
     if (mma_type_str == "bf16xbf16")
         return MmaKind::BF16;
-    DG_HOST_ASSERT(mma_type_str == "fp8xfp4");
-    return MmaKind::MXFP8FP4;
+    if (mma_type_str == "fp8xfp4")
+        return MmaKind::MXFP8FP4;
+    DG_HOST_ASSERT(mma_type_str == "fp8xfp8");
+    return MmaKind::MXFP8FP8;
 }
 
 static int get_num_mma_elem_bytes(const MmaKind& mma_kind) {
@@ -70,7 +72,13 @@ static int get_num_mma_elem_bytes(const MmaKind& mma_kind) {
 }
 
 static bool is_mma_with_sf(const MmaKind& mma_kind) {
-    return mma_kind == MmaKind::MXFP8FP4;
+    return mma_kind != MmaKind::BF16;
+}
+
+static bool is_mxfp8_e128_topk4(
+    const int& num_experts, const int& num_topk,
+    const MmaKind& mma_kind) {
+    return mma_kind == MmaKind::MXFP8FP8 and num_experts == 128 and num_topk == 4;
 }
 
 static std::tuple<int, int, int, int, int> get_block_config_for_mega_moe(
@@ -78,7 +86,12 @@ static std::tuple<int, int, int, int, int> get_block_config_for_mega_moe(
     const int& num_max_tokens_per_rank, const int& num_topk,
     const int& num_tokens,
     const MmaKind& mma_kind) {
+    const bool use_mxfp8_e128_m8192_config =
+        is_mxfp8_e128_topk4(num_experts, num_topk, mma_kind) and num_tokens == 8192;
     auto [cluster_size, block_m, store_block_m, block_k, num_epilogue_warpgroups] = [&]() -> std::tuple<int, int, int, int, int> {
+        if (use_mxfp8_e128_m8192_config)
+            return {2, layout::kLargeBatchMXFP8BlockM, 16, 128, 2};
+
         float num_expected_tokens_per_expert = static_cast<float>(num_tokens) * num_ranks * num_topk / num_experts;
         if (num_expected_tokens_per_expert <= 8.5) {
             // Really small token-per-expert (e.g. RL long-tail rollout), use the smallest block_m and larger BLOCK_K for less synchronization
@@ -103,7 +116,7 @@ static std::tuple<int, int, int, int, int> get_block_config_for_mega_moe(
     block_k /= get_num_mma_elem_bytes(mma_kind);
 
     // Check whether our `block_m` lies in `kCandidateBlockM`
-    DG_HOST_ASSERT(std::any_of(
+    DG_HOST_ASSERT(use_mxfp8_e128_m8192_config or std::any_of(
         layout::kCandidateBlockM, layout::kCandidateBlockM + layout::kNumCandidateBlockMs,
         [=](const auto& candidate) { return candidate == block_m; })
     );
@@ -195,8 +208,8 @@ static MegaMoEConfig get_mega_moe_config(
     const int load_block_m = block_m / 2;
     const int load_block_n = block_n;
     const auto [sf_block_m, sf_block_n] = is_mma_with_sf(mma_kind) ?
-        SM100ArchSpec::get_sf_uttcp_aligned_block_sizes(block_m, block_n, MmaKind::MXFP8FP4) : std::pair(0, 0);
-    // NOTES: FP8 activations and FP4 weights (unpacked to 8-bit in smem) both use 128B swizzle
+        SM100ArchSpec::get_sf_uttcp_aligned_block_sizes(block_m, block_n, mma_kind) : std::pair(0, 0);
+    // NOTES: FP8 activations and FP4/FP8 weights (FP4 is unpacked to 8-bit in smem) use 128B swizzle
     const int swizzle_acts_mode = 128;
     const int swizzle_weights_mode = 128;
     const int gran_k = 32;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cmath>
 #include <functional>
 #include <string>
 #include <pybind11/functional.h>
@@ -51,6 +52,12 @@ get_symm_buffer_size_for_mega_moe(
     const auto num_active_topk = std::min(num_topk, num_experts_per_rank);
     const auto num_max_routed_tokens = num_max_tokens_per_rank * num_ranks * num_active_topk;
 
+    // Parse MMA type
+    const auto mma_kind = parse_mma_kind(mma_type);
+    const auto with_sf = is_mma_with_sf(mma_kind);
+    const bool use_mxfp8_e128_m8192_buffer =
+        is_mxfp8_e128_topk4(num_experts, num_topk, mma_kind) and num_max_tokens_per_rank >= 8192;
+
     // Shared
     const int shared_intermediate_hidden = intermediate_hidden * num_shared_experts;
 
@@ -62,11 +69,17 @@ get_symm_buffer_size_for_mega_moe(
             num_pool_blocks, num_sms, hidden, intermediate_hidden);
         num_ring_tokens = std::max(num_ring_tokens, num_live_pool_blocks * block_m);
     }
-    num_ring_tokens = math::align(num_ring_tokens, layout::kLCMCandidateBlockM);
-
-    // Parse MMA type
-    const auto mma_kind = parse_mma_kind(mma_type);
-    const auto with_sf = is_mma_with_sf(mma_kind);
+    if (use_mxfp8_e128_m8192_buffer) {
+        const auto block_m = layout::kLargeBatchMXFP8BlockM;
+        const auto num_pool_blocks = ceil_div(num_max_routed_tokens, block_m) + num_experts_per_rank;
+        const auto num_live_pool_blocks = sched::get_num_max_live_pool_blocks(
+            num_pool_blocks, num_sms, hidden, intermediate_hidden);
+        num_ring_tokens = std::max(num_ring_tokens, num_live_pool_blocks * block_m);
+    }
+    num_ring_tokens = math::align(
+        num_ring_tokens,
+        use_mxfp8_e128_m8192_buffer ?
+            layout::kLCMLargeBatchMXFP8BlockM : layout::kLCMCandidateBlockM);
 
     // Compute num_sf_ring_tokens (max across all candidate block sizes)
     int num_sf_ring_tokens = 0;
@@ -75,6 +88,11 @@ get_symm_buffer_size_for_mega_moe(
             num_sf_ring_tokens = std::max(
                 num_sf_ring_tokens,
                 layout::get_num_sf_ring_tokens(num_ring_tokens, block_m));
+        }
+        if (use_mxfp8_e128_m8192_buffer) {
+            num_sf_ring_tokens = std::max(
+                num_sf_ring_tokens,
+                layout::get_num_sf_ring_tokens(num_ring_tokens, layout::kLargeBatchMXFP8BlockM));
         }
     }
 
@@ -168,7 +186,9 @@ static void fp8_fp4_mega_moe(
     const std::tuple<int, int, int>& recipe,
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
-    const bool& fast_math
+    const bool& fast_math,
+    const float& activation_alpha,
+    const float& activation_beta
 ) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
@@ -184,6 +204,8 @@ static void fp8_fp4_mega_moe(
     const auto activation_clamp =
         activation_clamp_opt.value_or(std::numeric_limits<float>::infinity());
     DG_HOST_ASSERT(activation_clamp >= 0);
+    DG_HOST_ASSERT(std::isfinite(activation_alpha));
+    DG_HOST_ASSERT(std::isfinite(activation_beta));
 
     // Tensor checks
     DG_HOST_ASSERT(get_major_type_ab(l1_weights) == cute::UMMA::Major::K);
@@ -193,13 +215,15 @@ static void fp8_fp4_mega_moe(
         check_grouped_ab_fp8_fp4(l1_weights, cute::UMMA::Major::K, arch_major);
     const auto [num_experts_per_rank_, hidden_, intermediate_hidden] =
         check_grouped_ab_fp8_fp4(l2_weights, cute::UMMA::Major::K, arch_major);
-    DG_HOST_ASSERT(l1_weights.scalar_type() == kPackedFP4);
-    DG_HOST_ASSERT(l2_weights.scalar_type() == kPackedFP4);
     DG_HOST_ASSERT(num_tokens <= num_max_tokens_per_rank);
     DG_HOST_ASSERT(num_experts_per_rank == num_experts_per_rank_);
     DG_HOST_ASSERT(hidden == hidden_);
     DG_HOST_ASSERT(intermediate_hidden_2 == 2 * intermediate_hidden);
+    DG_HOST_ASSERT(l1_weights.scalar_type() == l2_weights.scalar_type());
     DG_HOST_ASSERT(l1_weights.is_contiguous() and l2_weights.is_contiguous());
+    const auto weight_dtype = l1_weights.scalar_type();
+    DG_HOST_ASSERT(weight_dtype == kPackedFP4 or weight_dtype == torch::kFloat8_e4m3fn);
+    const auto mma_type = weight_dtype == kPackedFP4 ? "fp8xfp4" : "fp8xfp8";
 
     // Check weight SF layout for UE8M0 packing, MN-major, and TMA alignment
     constexpr int kGranMN = 1, kGranK = 32;
@@ -246,7 +270,7 @@ static void fp8_fp4_mega_moe(
         num_ranks, num_experts,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
-        "fp8xfp4", activation, num_shared_experts
+        mma_type, activation, num_shared_experts
     );
     DG_HOST_ASSERT(sym_buffer.nbytes() >= static_cast<size_t>(num_required_bytes));
     DG_HOST_ASSERT(num_experts == num_experts_);
@@ -274,7 +298,8 @@ static void fp8_fp4_mega_moe(
                                num_shared_experts,
                                num_tokens, num_topk,
                                hidden, intermediate_hidden,
-                               activation_clamp, fast_math);
+                               activation_clamp, activation_alpha, activation_beta,
+                               fast_math);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -298,7 +323,9 @@ static void bf16_mega_moe(
     const int& num_experts, const int& num_topk,
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
-    const bool& fast_math
+    const bool& fast_math,
+    const float& activation_alpha,
+    const float& activation_beta
 ) {
     // Config checks
     const auto num_tokens = static_cast<int>(y.size(0));
@@ -309,6 +336,8 @@ static void bf16_mega_moe(
     const auto activation_clamp =
         activation_clamp_opt.value_or(std::numeric_limits<float>::infinity());
     DG_HOST_ASSERT(activation_clamp >= 0);
+    DG_HOST_ASSERT(std::isfinite(activation_alpha));
+    DG_HOST_ASSERT(std::isfinite(activation_beta));
 
     // Tensor checks
     DG_HOST_ASSERT(get_major_type_ab(l1_weights) == cute::UMMA::Major::K);
@@ -382,7 +411,8 @@ static void bf16_mega_moe(
                             num_shared_experts,
                             num_tokens, num_topk,
                             hidden, intermediate_hidden,
-                            activation_clamp, fast_math);
+                            activation_clamp, activation_alpha, activation_beta,
+                            fast_math);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -399,6 +429,7 @@ static void register_apis(pybind11::module_& m) {
     m.def("get_block_m_for_mega_moe", &get_block_m_for_mega_moe);
     m.def("get_symm_buffer_size_for_mega_moe", &get_symm_buffer_size_for_mega_moe);
     m.def("fp8_fp4_mega_moe", &fp8_fp4_mega_moe);
+    m.def("fp8_fp8_mega_moe", &fp8_fp4_mega_moe);
     m.def("bf16_mega_moe", &bf16_mega_moe);
 #endif
 }

@@ -113,29 +113,46 @@ For more details and the paged version `fp8_paged_mqa_logits`, please refer to `
 
 #### Mega MoE
 
-Mega MoE fuses and overlaps EP dispatch, linear 1 (FP8xFP4), SwiGLU, linear 2 (FP8xFP4), and EP combine into a single mega-kernel, overlapping NVLink communication and tensor core computation. It requires multi-process launch with symmetric memory. Usage:
+Mega MoE fuses and overlaps EP dispatch, linear 1, SwiGLU, linear 2, optional shared experts, and EP combine into a single mega-kernel, overlapping NVLink communication and tensor core computation. It supports FP8 activations with FP4 or FP8 weights, as well as BF16 activations and weights. It requires multi-process launch with symmetric memory. Usage:
 
 ```python
 # Allocate symmetric memory buffer
 # NOTES: requires PyTorch >= 2.9
 buffer = deep_gemm.get_symm_buffer_for_mega_moe(
-    group, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden
+    group, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden,
+    num_shared_experts=1, mma_type='fp8xfp8'
 )
 
-# Transform weights (FP4 with UE8M0 SF) into the required layout
+# Transform routed and shared FP8 weights with UE8M0 SF into the required layout
 transformed_l1, transformed_l2 = deep_gemm.transform_weights_for_mega_moe(l1_weights, l2_weights)
+transformed_shared_l1, transformed_shared_l2 = deep_gemm.transform_weights_for_mega_moe(
+    shared_l1_weights, shared_l2_weights
+)
 
 # Copy inputs into the buffer before each call
 # You may fuse these into previous kernels
 buffer.x[:num_tokens].copy_(x_fp8)
 buffer.x_sf[:num_tokens].copy_(x_sf)
+# `shared_x_sf` uses the shared-expert SF layout shown in `tests/test_mega_moe.py`.
+buffer.shared_l1_acts_sf.copy_(shared_x_sf)
 buffer.topk_idx[:num_tokens].copy_(topk_idx)
 buffer.topk_weights[:num_tokens].copy_(topk_weights)
 
 # Run the fused mega MoE kernel
 y = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
-deep_gemm.fp8_fp4_mega_moe(y, transformed_l1, transformed_l2, buffer)
+deep_gemm.fp8_fp8_mega_moe(
+    y, transformed_l1, transformed_l2, buffer,
+    shared_l1_weights=transformed_shared_l1,
+    shared_l2_weights=transformed_shared_l2,
+    activation_clamp=10.0,
+    activation_alpha=1.0,
+    activation_beta=0.0
+)
 ```
+
+The fused SwiGLU computes `gate * sigmoid(activation_alpha * gate) * (up + activation_beta)`.
+When `activation_clamp` is set, `gate` is upper-clamped and `up` is clamped symmetrically;
+`None` disables clamping.
 
 For the full example with multi-process setup and benchmarking, please refer to `tests/test_mega_moe.py`.
 

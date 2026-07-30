@@ -10,8 +10,11 @@ namespace deep_gemm::layout {
 static constexpr int kNumCandidateBlockMs = 7;
 static constexpr int kCandidateBlockM[kNumCandidateBlockMs] = {8, 16, 32, 64, 96, 128, 192};
 static constexpr int kMaxCandidateBlockM = 192;
+static constexpr int kLargeBatchMXFP8BlockM = 224;
+static constexpr int kMaxSupportedBlockM = kLargeBatchMXFP8BlockM;
 static constexpr int kMinCandidateBlockM = 8;
 static constexpr int kLCMCandidateBlockM = 384;
+static constexpr int kLCMLargeBatchMXFP8BlockM = 2688;
 
 // Pool capacity for shared expert token pool: worst-case total tokens + per-expert BLOCK_M alignment padding, among all possible BLOCK_M
 template <typename T>
@@ -20,7 +23,7 @@ CUTLASS_HOST_DEVICE constexpr T get_num_max_pool_tokens(T num_ranks, T num_max_t
     const auto num_max_recv_tokens = num_ranks * num_max_tokens_per_rank;
     const auto num_max_experts_per_token = math::constexpr_min(num_topk, num_experts_per_rank);
     return math::constexpr_align(
-        num_max_recv_tokens * num_max_experts_per_token + num_experts_per_rank * (static_cast<T>(kMaxCandidateBlockM) - 1),
+        num_max_recv_tokens * num_max_experts_per_token + num_experts_per_rank * (static_cast<T>(kMaxSupportedBlockM) - 1),
         static_cast<T>(kLCMCandidateBlockM));
 }
 
